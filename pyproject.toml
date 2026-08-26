@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sqlite-carver-pro"
+version = "1.2.0"
+description = "Production-grade SQLite digital forensics, deleted record carving, freelist recovery, and WAL diff engine"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Dam-FOR3K" }
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Information Technology",
+    "Topic :: Security",
+    "Topic :: System :: Recovery Tools",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=10.0.0"]
+all = [
+    "pyarrow>=10.0.0",
+    "protobuf>=4.0.0",
+]
+
+[project.scripts]
+sqlite-carver = "sqlite_carver.cli:main"
+sqlite-carver-pro = "sqlite_carver.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sqlite_carver*"]
