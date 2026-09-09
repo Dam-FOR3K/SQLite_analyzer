@@ -442,9 +442,42 @@ def cmd_search(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    examples = """
+Exemples d'utilisation concrets / Concrete usage examples:
+  1. Inspecter la structure et les tables d'une base :
+     sqlite-carver info ma_base.db
+
+  2. Carving complet (actifs + supprimés dans le slack/freeblocks) :
+     sqlite-carver carve ma_base.db
+
+  3. Isoler UNIQUEMENT les enregistrements supprimés :
+     sqlite-carver carve ma_base.db --deleted-only
+
+  4. Générer le rapport interactif HTML (avec recherche, timeline WAL, horodatages) :
+     sqlite-carver carve ma_base.db --export rapport.html
+
+  5. Extraire automatiquement les fichiers intégrés dans les BLOBs (PNG, JPEG, PDF...) :
+     sqlite-carver carve ma_base.db --dump-blobs ./fichiers_extraits
+
+  6. Recherche récursive d'un mot-clé (texte, WAL, BLOBs bplist/protobuf) :
+     sqlite-carver search ma_base.db "mon_mot_cle"
+
+  7. Historique différentiel des transactions WAL avant/après :
+     sqlite-carver wal-diff ma_base.db ma_base.db-wal --export timeline.html
+
+Astuce : Chaque commande possède sa propre aide détaillée avec toutes ses options :
+  sqlite-carver carve -h
+  sqlite-carver search -h
+  sqlite-carver wal-diff -h
+  sqlite-carver info -h
+  sqlite-carver decode-blob -h
+"""
+
     parser = argparse.ArgumentParser(
         prog="sqlite-carver",
         description="SQLite-Carver-Pro: Forensic Parser, Slack Carver, Freelist & WAL Diff Engine",
+        epilog=examples,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--lang", "-l", choices=["en", "fr"], default="en", help="Language interface (en: English, fr: Français)")
