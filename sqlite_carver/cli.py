@@ -147,7 +147,8 @@ def cmd_carve(args: argparse.Namespace) -> None:
             try:
                 wal_engine = WalDiffEngine(raw_data, wal_bytes)
                 if not wal_engine.wal_header:
-                    console.print(f"[dim]{t('wal_empty_or_reset', name=wal_path.name)}[/dim]")
+                    magic_val = struct.unpack(">I", wal_bytes[:4])[0] if len(wal_bytes) >= 4 else 0
+                    console.print(f"[yellow]{t('wal_invalid_magic', name=wal_path.name, size=len(wal_bytes), magic=magic_val)}[/yellow]")
                 else:
                     wal_mutations = wal_engine.compute_timeline_diff()
             except Exception as e:
