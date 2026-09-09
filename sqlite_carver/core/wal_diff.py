@@ -64,7 +64,17 @@ class WalHeader:
             return None
         magic, ver, psize, seq, s1, s2, c1, c2 = struct.unpack(">8I", data[:32])
         if magic not in (0x377F0682, 0x377F0683):
-            return None
+            # Check little-endian unpack if big-endian magic not matched
+            magic_le, ver_le, psize_le, seq_le, s1_le, s2_le, c1_le, c2_le = struct.unpack("<8I", data[:32])
+            if magic_le in (0x377F0682, 0x377F0683):
+                magic, ver, psize, seq, s1, s2, c1, c2 = magic_le, ver_le, psize_le, seq_le, s1_le, s2_le, c1_le, c2_le
+            else:
+                return None
+
+        # Validate reasonable page size (power of two between 512 and 65536)
+        if not (512 <= psize <= 65536 and (psize & (psize - 1)) == 0):
+            psize = 4096
+
         return cls(
             magic=magic,
             format_version=ver,
@@ -165,7 +175,7 @@ class WalDiffEngine:
 
     def _parse_frames(self) -> None:
         """Iterates over all 24-byte headers + page payloads in WAL file."""
-        if len(self.wal_data) < 32:
+        if not self.wal_header or len(self.wal_data) < 32:
             return
 
         offset = 32  # Skip 32-byte WAL header
@@ -176,7 +186,12 @@ class WalDiffEngine:
             chunk = self.wal_data[offset : offset + frame_size]
             frame = WalFrame.from_bytes(frame_idx, chunk, self.page_size)
             if frame:
-                self.frames.append(frame)
+                # Stop if salt doesn't match current active transaction sequence (stale checkpointed frames)
+                if self.wal_header and frame.salt1 != self.wal_header.salt1:
+                    break
+                # Only keep frames referencing a valid page_id
+                if 1 <= frame.page_id <= 10_000_000:
+                    self.frames.append(frame)
             offset += frame_size
             frame_idx += 1
 
@@ -197,14 +212,13 @@ class WalDiffEngine:
 
         # Iterate through WAL frames sequentially
         for frame in self.frames:
-            # Build a temporary parser for this single frame page
-            # To parse page properly, if page_id == 1, frame page has 100-byte db header.
-            frame_carver = SQLiteCarver(
-                frame.page_data if frame.page_id == 1 else (b"\x00" * ((frame.page_id - 1) * self.page_size) + frame.page_data),
-                user_schemas=list(self.base_carver.schemas.values()),
+            # Carve the single frame page data directly without any dummy memory allocation
+            frame_records = self.base_carver.carve_page_data(
+                frame.page_data,
+                page_id=frame.page_id,
+                is_page_1=(frame.page_id == 1),
+                include_active=True,
             )
-            
-            frame_records = frame_carver.carve_page(frame.page_id, include_active=True)
             active_frame_records = [r for r in frame_records if r.source == "active"]
             deleted_frame_records = [r for r in frame_records if r.source in ("freeblock", "slack", "unallocated")]
 

@@ -499,19 +499,22 @@ class SQLiteCarver:
 
         return results
 
-    def carve_page(self, page_id: int, include_active: bool = True) -> List[CarvedRecord]:
+    def carve_page_data(
+        self,
+        page_bytes: bytes | memoryview,
+        page_id: int = 1,
+        is_page_1: bool = False,
+        include_active: bool = True,
+    ) -> List[CarvedRecord]:
         """
-        Performs in-depth forensic carving on a single database page:
+        Performs in-depth forensic carving directly on raw page bytes:
         - Active cells
         - Freeblocks (deleted cells in page freelist)
         - Unallocated space (gap between cell pointers and cell content area)
         - Cell Slack space (unreferenced gaps between active cell intervals)
         """
-        page_bytes = self.parser.get_page_bytes(page_id)
-        if page_bytes is None:
-            return []
-
-        hdr = self.parser.parse_page_header(page_id)
+        page_mem = memoryview(page_bytes)
+        hdr = self.parser.parse_page_header_from_bytes(page_mem, is_page_1=is_page_1)
         records: List[CarvedRecord] = []
         known_offsets: Set[int] = set()
 
@@ -519,11 +522,11 @@ class SQLiteCarver:
         occupied_intervals: List[Tuple[int, int]] = []
 
         # 1. Active Cells
-        active_cells = self.parser.get_active_cells(page_id)
+        active_cells = self.parser.get_active_cells_from_bytes(page_mem, page_id=page_id, is_page_1=is_page_1)
         for c in active_cells:
             known_offsets.add(c.offset_in_page)
             cell_len = len(c.raw_payload) + 4  # Lower bound / estimated size
-            occupied_intervals.append((c.offset_in_page, min(len(page_bytes), c.offset_in_page + cell_len)))
+            occupied_intervals.append((c.offset_in_page, min(len(page_mem), c.offset_in_page + cell_len)))
             if include_active and c.record:
                 tbl, conf, cols = self.match_schema(c.record.serial_types, c.record.values)
                 records.append(
@@ -545,10 +548,10 @@ class SQLiteCarver:
                 )
 
         # 2. Freeblocks (First 4 bytes are next_offset and size pointers)
-        freeblocks = self.parser.get_freeblocks(page_id)
+        freeblocks = self.parser.get_freeblocks_from_bytes(page_mem, is_page_1=is_page_1)
         for fb in freeblocks:
             known_offsets.add(fb.offset)
-            occupied_intervals.append((fb.offset, min(len(page_bytes), fb.offset + fb.size)))
+            occupied_intervals.append((fb.offset, min(len(page_mem), fb.offset + fb.size)))
             if len(fb.raw_bytes) > 4:
                 fb_records = self.scan_bytes_for_records(
                     fb.raw_bytes[4:],
@@ -562,8 +565,8 @@ class SQLiteCarver:
         # 3. Unallocated Space (Between end of cell pointer array and cell content start)
         ptr_array_end = hdr.header_offset + hdr.header_size + (hdr.cell_count * 2)
         cell_start = hdr.cell_content_start
-        if ptr_array_end < cell_start and cell_start <= len(page_bytes):
-            unalloc_bytes = page_bytes[ptr_array_end:cell_start]
+        if ptr_array_end < cell_start and cell_start <= len(page_mem):
+            unalloc_bytes = page_mem[ptr_array_end:cell_start]
             unalloc_recs = self.scan_bytes_for_records(
                 unalloc_bytes,
                 page_id=page_id,
@@ -577,7 +580,7 @@ class SQLiteCarver:
         # Accurately compute unreferenced gaps between occupied intervals and boundary areas
         if hdr.page_type in (PageType.TABLE_LEAF, PageType.INDEX_LEAF) and occupied_intervals:
             # Include cell_content_start boundary and page_size boundary
-            all_boundaries = [(cell_start, cell_start)] + list(occupied_intervals) + [(len(page_bytes), len(page_bytes))]
+            all_boundaries = [(cell_start, cell_start)] + list(occupied_intervals) + [(len(page_mem), len(page_mem))]
             all_boundaries.sort(key=lambda x: x[0])
             
             for i in range(len(all_boundaries) - 1):
@@ -586,7 +589,7 @@ class SQLiteCarver:
                 
                 # Check for genuine gap between consecutive occupied intervals
                 if next_start > cur_end and (next_start - cur_end) >= 8:
-                    gap_data = page_bytes[cur_end:next_start]
+                    gap_data = page_mem[cur_end:next_start]
                     gap_recs = self.scan_bytes_for_records(
                         gap_data,
                         page_id=page_id,
@@ -597,6 +600,24 @@ class SQLiteCarver:
                     records.extend(gap_recs)
 
         return records
+
+    def carve_page(self, page_id: int, include_active: bool = True) -> List[CarvedRecord]:
+        """
+        Performs in-depth forensic carving on a single database page:
+        - Active cells
+        - Freeblocks (deleted cells in page freelist)
+        - Unallocated space (gap between cell pointers and cell content area)
+        - Cell Slack space (unreferenced gaps between active cell intervals)
+        """
+        page_bytes = self.parser.get_page_bytes(page_id)
+        if page_bytes is None:
+            return []
+        return self.carve_page_data(
+            page_bytes,
+            page_id=page_id,
+            is_page_1=(page_id == 1),
+            include_active=include_active,
+        )
 
     def carve_all(self, include_active: bool = True) -> List[CarvedRecord]:
         """Carves all pages in the database file including active, freelists, and unallocated pages."""

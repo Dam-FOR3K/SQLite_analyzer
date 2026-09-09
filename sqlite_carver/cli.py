@@ -137,11 +137,22 @@ def cmd_carve(args: argparse.Namespace) -> None:
             wal_path = alt_wal
 
     if wal_path.exists():
-        try:
-            wal_engine = WalDiffEngine(raw_data, wal_path.read_bytes())
-            wal_mutations = wal_engine.compute_timeline_diff()
-        except Exception as e:
-            console.print(t("wal_warning", name=wal_path.name, err=e))
+        wal_bytes = wal_path.read_bytes()
+        if len(wal_bytes) == 0 or wal_bytes[:4] == b"\x00\x00\x00\x00":
+            # Normal checkpointed / reset WAL (no active pending transactions)
+            pass
+        elif len(wal_bytes) < 32:
+            console.print(f"[dim]{t('wal_empty_or_reset', name=wal_path.name)}[/dim]")
+        else:
+            try:
+                wal_engine = WalDiffEngine(raw_data, wal_bytes)
+                if not wal_engine.wal_header:
+                    console.print(f"[dim]{t('wal_empty_or_reset', name=wal_path.name)}[/dim]")
+                else:
+                    wal_mutations = wal_engine.compute_timeline_diff()
+            except Exception as e:
+                err_msg = str(e).strip() or e.__class__.__name__
+                console.print(t("wal_warning", name=wal_path.name, err=err_msg))
 
     # Summary
     source_counts = {}
@@ -256,6 +267,9 @@ def cmd_wal_diff(args: argparse.Namespace) -> None:
     engine = WalDiffEngine(db_data, wal_data)
 
     if not engine.wal_header:
+        if len(wal_data) < 32 or wal_data[:4] == b"\x00\x00\x00\x00":
+            console.print(f"[yellow]{t('wal_empty_or_reset', name=wal_path.name)}[/yellow]")
+            return
         console.print(f"[bold red]Error:[/] {t('invalid_wal_header', path=wal_path)}")
         sys.exit(1)
 
@@ -350,8 +364,16 @@ def cmd_search(args: argparse.Namespace) -> None:
 
     db_data = db_path.read_bytes()
     wal_path = Path(args.wal_path) if args.wal_path else db_path.with_name(db_path.name + "-wal")
+    if not wal_path.exists() and db_path.suffix == ".db":
+        alt_wal = db_path.with_suffix(".wal")
+        if alt_wal.exists():
+            wal_path = alt_wal
     include_wal_flag = getattr(args, "include_wal", True)
-    wal_data = wal_path.read_bytes() if (include_wal_flag and wal_path.exists()) else None
+    wal_data = None
+    if include_wal_flag and wal_path.exists():
+        wb = wal_path.read_bytes()
+        if len(wb) >= 32 and wb[:4] != b"\x00\x00\x00\x00":
+            wal_data = wb
 
     engine = ForensicSearchEngine(db_data, wal_data=wal_data)
     matches = engine.search(

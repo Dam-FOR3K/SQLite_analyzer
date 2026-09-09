@@ -76,3 +76,37 @@ def test_wal_diff_end_to_end():
         shm_path = db_path.with_name(db_path.name + "-shm")
         if shm_path.exists():
             shm_path.unlink()
+
+
+def test_wal_empty_and_zeroed():
+    db_data = b"SQLite format 3\x00" + b"\x00" * 4080
+    # Empty WAL
+    engine_empty = WalDiffEngine(db_data, b"")
+    assert engine_empty.wal_header is None
+    assert len(engine_empty.frames) == 0
+    assert engine_empty.compute_timeline_diff() == []
+
+    # Zeroed WAL (checkpointed/reset state)
+    zeroed_wal = b"\x00" * 4096
+    engine_zeroed = WalDiffEngine(db_data, zeroed_wal)
+    assert engine_zeroed.wal_header is None
+    assert len(engine_zeroed.frames) == 0
+    assert engine_zeroed.compute_timeline_diff() == []
+
+
+def test_wal_high_page_id_no_memory_error():
+    import struct
+    db_data = b"SQLite format 3\x00" + b"\x00" * 4080
+    raw_wal = bytearray(32 + 24 + 4096)
+    # Header
+    struct.pack_into(">8I", raw_wal, 0, 0x377F0682, 3007000, 4096, 1, 999, 888, 1, 2)
+    # Frame with huge page_id (e.g. 500,000) that previously caused MemoryError
+    struct.pack_into(">6I", raw_wal, 32, 500000, 1, 999, 888, 1, 2)
+    # Page data with dummy leaf page header (0x0D, cell_count=0)
+    struct.pack_into(">BHHHB", raw_wal, 32 + 24, 0x0D, 0, 0, 4096, 0)
+
+    engine = WalDiffEngine(db_data, bytes(raw_wal))
+    assert len(engine.frames) == 1
+    # Must compute without MemoryError
+    mutations = engine.compute_timeline_diff()
+    assert isinstance(mutations, list)

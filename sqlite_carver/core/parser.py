@@ -336,11 +336,17 @@ class DatabaseParser:
             return None
         return self.data[start:min(end, self.size)]
 
+    def parse_page_header_from_bytes(self, page_bytes: bytes | memoryview, is_page_1: bool = False) -> PageHeader:
+        """Parses a PageHeader directly from raw page bytes."""
+        if not page_bytes:
+            return PageHeader(PageType.UNKNOWN, 0, 0, 0, 0)
+        return PageHeader.from_bytes(memoryview(page_bytes), is_page_1=is_page_1)
+
     def parse_page_header(self, page_id: int) -> PageHeader:
         page_bytes = self.get_page_bytes(page_id)
         if page_bytes is None:
             return PageHeader(PageType.UNKNOWN, 0, 0, 0, 0)
-        return PageHeader.from_bytes(page_bytes, is_page_1=(page_id == 1))
+        return self.parse_page_header_from_bytes(page_bytes, is_page_1=(page_id == 1))
 
     def reassemble_overflow_chain(self, first_overflow_page: int, needed_bytes: int) -> bytes:
         """
@@ -496,22 +502,19 @@ class DatabaseParser:
 
         return None
 
-    def get_freeblocks(self, page_id: int) -> List[Freeblock]:
-        """Traverses the linked list of freeblocks on a page."""
-        page_data = self.get_page_bytes(page_id)
-        if page_data is None:
-            return []
-
-        hdr = self.parse_page_header(page_id)
+    def get_freeblocks_from_bytes(self, page_data: bytes | memoryview, is_page_1: bool = False) -> List[Freeblock]:
+        """Traverses the linked list of freeblocks on raw page bytes."""
+        page_mem = memoryview(page_data)
+        hdr = self.parse_page_header_from_bytes(page_mem, is_page_1=is_page_1)
         freeblocks: List[Freeblock] = []
         curr_offset = hdr.first_freeblock
         visited = set()
 
-        while curr_offset > 0 and curr_offset not in visited and curr_offset + 4 <= len(page_data):
+        while curr_offset > 0 and curr_offset not in visited and curr_offset + 4 <= len(page_mem):
             visited.add(curr_offset)
-            next_fb, fb_size = struct.unpack(">HH", page_data[curr_offset : curr_offset + 4])
+            next_fb, fb_size = struct.unpack(">HH", page_mem[curr_offset : curr_offset + 4])
             fb_size = max(fb_size, 4)
-            raw = bytes(page_data[curr_offset : min(curr_offset + fb_size, len(page_data))])
+            raw = bytes(page_mem[curr_offset : min(curr_offset + fb_size, len(page_mem))])
             freeblocks.append(
                 Freeblock(
                     offset=curr_offset,
@@ -524,13 +527,22 @@ class DatabaseParser:
 
         return freeblocks
 
-    def get_active_cells(self, page_id: int) -> List[Cell]:
-        """Extracts all active cells referenced in the cell pointer array."""
+    def get_freeblocks(self, page_id: int) -> List[Freeblock]:
+        """Traverses the linked list of freeblocks on a page."""
         page_data = self.get_page_bytes(page_id)
         if page_data is None:
             return []
+        return self.get_freeblocks_from_bytes(page_data, is_page_1=(page_id == 1))
 
-        hdr = self.parse_page_header(page_id)
+    def get_active_cells_from_bytes(
+        self,
+        page_data: bytes | memoryview,
+        page_id: int = 1,
+        is_page_1: bool = False,
+    ) -> List[Cell]:
+        """Extracts all active cells referenced in the cell pointer array of raw page bytes."""
+        page_mem = memoryview(page_data)
+        hdr = self.parse_page_header_from_bytes(page_mem, is_page_1=is_page_1)
         if hdr.page_type == PageType.UNKNOWN or hdr.cell_count == 0:
             return []
 
@@ -539,14 +551,21 @@ class DatabaseParser:
         
         for i in range(hdr.cell_count):
             ptr_offset = ptr_start + i * 2
-            if ptr_offset + 2 > len(page_data):
+            if ptr_offset + 2 > len(page_mem):
                 break
-            cell_offset = struct.unpack(">H", page_data[ptr_offset : ptr_offset + 2])[0]
-            cell = self.parse_cell(page_id, page_data, hdr, cell_offset, source="active")
+            cell_offset = struct.unpack(">H", page_mem[ptr_offset : ptr_offset + 2])[0]
+            cell = self.parse_cell(page_id, page_mem, hdr, cell_offset, source="active")
             if cell:
                 cells.append(cell)
 
         return cells
+
+    def get_active_cells(self, page_id: int) -> List[Cell]:
+        """Extracts all active cells referenced in the cell pointer array."""
+        page_data = self.get_page_bytes(page_id)
+        if page_data is None:
+            return []
+        return self.get_active_cells_from_bytes(page_data, page_id=page_id, is_page_1=(page_id == 1))
 
     def parse_freelist_pages(self) -> List[int]:
         """Traverses the database freelist trunk and leaf hierarchy."""
