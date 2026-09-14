@@ -7,7 +7,7 @@ carve, and analyze deleted records, freelists, unallocated spaces, and WAL
 transaction diffs from SQLite databases.
 """
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 from sqlite_carver.core.carver import CarvedRecord, IndexSchema, SQLiteCarver, TableSchema
 from sqlite_carver.core.correlator import EntityCorrelator, FKLink, FKResolution
@@ -38,9 +38,30 @@ from sqlite_carver.decoders.blobs import (
 )
 from sqlite_carver.decoders.geolocation import DecodedCoordinate, extract_coordinates
 from sqlite_carver.decoders.timestamps import DecodedTimestamp, decode_timestamp, get_all_possible_timestamps
-from sqlite_carver.core.encryption import EncryptionAnalysis, analyze_database_encryption, calculate_shannon_entropy
+from sqlite_carver.core.encryption import (
+    EncryptionAnalysis,
+    analyze_database_encryption,
+    calculate_shannon_entropy,
+    decrypt_sqlcipher_database,
+    decrypt_sqlcipher_page,
+    try_decrypt_database,
+)
 from sqlite_carver.core.mutations import MutationDelta, detect_record_mutations
+from sqlite_carver.exporters.export import (
+    dispatch_export,
+    export_csv,
+    export_html,
+    export_json,
+    export_jsonl,
+    export_parquet,
+    export_sqlite,
+)
 from sqlite_carver.exporters.html_report import generate_html_report
+
+try:
+    from sqlite_carver.gui.app import HexInspectorModal, SQLiteCarverApp, launch_gui
+except ImportError:
+    pass
 
 __all__ = [
     "SQLiteCarver",
@@ -102,4 +123,10 @@ __all__ = [
     "export_parquet",
     "export_sqlite",
     "dispatch_export",
+    "try_decrypt_database",
+    "decrypt_sqlcipher_database",
+    "decrypt_sqlcipher_page",
+    "launch_gui",
+    "SQLiteCarverApp",
+    "HexInspectorModal",
 ]

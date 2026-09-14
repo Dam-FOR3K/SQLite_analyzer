@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from sqlite_carver import __version__
 from sqlite_carver.core.carver import CarvedRecord
@@ -25,6 +26,7 @@ def generate_html_report(
     records: List[Union[CarvedRecord, RowMutation]],
     output_path: str | Path,
     title: str = "SQLite Forensic Investigation Report",
+    schemas: Optional[Dict[str, Any]] = None,
     storage_breakdown: Optional[Dict[str, Any]] = None,
     integrity_info: Optional[Dict[str, Any]] = None,
     shm_info: Optional[Dict[str, Any]] = None,
@@ -83,6 +85,60 @@ def generate_html_report(
 
     freelist_count = source_stats.get('freelist', 0)
     reserved_count = source_stats.get('page_reserved_space', 0) + source_stats.get('reserved_space', 0)
+    resurrected_count = source_stats.get('resurrected_from_index', 0)
+
+    schema_tables = []
+    schema_relations = []
+    mermaid_er_code = ""
+
+    if schemas:
+        try:
+            from sqlite_carver.core.correlator import EntityCorrelator
+            correlator = EntityCorrelator(schemas)
+            for link in correlator.fk_links:
+                schema_relations.append({
+                    "source_table": link.source_table,
+                    "source_column": link.source_column,
+                    "target_table": link.target_table,
+                    "target_column": link.target_column,
+                })
+        except Exception:
+            pass
+
+        for tbl_name, s in schemas.items():
+            cols = []
+            pk_idx = getattr(s, "pk_col_idx", None)
+            for i, col in enumerate(getattr(s, "columns", [])):
+                is_pk = (pk_idx is not None and i == pk_idx)
+                cols.append({
+                    "name": col.name,
+                    "affinity": col.affinity,
+                    "is_pk": is_pk,
+                })
+            schema_tables.append({
+                "name": tbl_name,
+                "root_page": getattr(s, "root_page", 0),
+                "sql": getattr(s, "sql", ""),
+                "is_without_rowid": getattr(s, "is_without_rowid", False),
+                "columns": cols,
+            })
+
+        er_lines = ["erDiagram"]
+        for t in schema_tables:
+            t_clean = re.sub(r'[^a-zA-Z0-9_]', '_', t["name"])
+            er_lines.append(f"    {t_clean} {{")
+            for col in t["columns"]:
+                c_clean = re.sub(r'[^a-zA-Z0-9_]', '_', col["name"])
+                aff = col["affinity"] or "TEXT"
+                pk_marker = " PK" if col["is_pk"] else ""
+                er_lines.append(f"        {aff} {c_clean}{pk_marker}")
+            er_lines.append("    }")
+        for r in schema_relations:
+            src = re.sub(r'[^a-zA-Z0-9_]', '_', r["source_table"])
+            tgt = re.sub(r'[^a-zA-Z0-9_]', '_', r["target_table"])
+            col = re.sub(r'[^a-zA-Z0-9_]', '_', r["source_column"])
+            er_lines.append(f'    {tgt} ||--o{{ {src} : "{col}"')
+        mermaid_er_code = "\n".join(er_lines)
 
     res_b_per_page = 0
     if storage_breakdown and hasattr(storage_breakdown, 'reserved_space_per_page'):
@@ -109,6 +165,7 @@ def generate_html_report(
     storage_payload = json.dumps(storage_breakdown or {}, ensure_ascii=False, default=json_safe_default).replace("</", r"\u003c/")
     integrity_payload = json.dumps(integrity_info or {}, ensure_ascii=False, default=json_safe_default).replace("</", r"\u003c/")
     shm_payload = json.dumps(shm_info or {}, ensure_ascii=False, default=json_safe_default).replace("</", r"\u003c/")
+    schema_payload = json.dumps({"tables": schema_tables, "relations": schema_relations, "mermaid": mermaid_er_code}, ensure_ascii=False, default=json_safe_default).replace("</", r"\u003c/")
 
     html_content = f"""<!DOCTYPE html>
 <html lang="fr">
@@ -639,6 +696,282 @@ def generate_html_report(
             border-radius: 4px;
         }}
 
+        /* Resurrected Badge */
+        .badge-resurrected {{ background-color: rgba(168, 85, 247, 0.2); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.4); }}
+
+        /* Hex Inspector Button */
+        .btn-hex {{
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            background: rgba(56, 189, 248, 0.12);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            color: #38bdf8;
+            padding: 2px 7px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            margin-left: 6px;
+        }}
+        .btn-hex:hover {{
+            background: rgba(56, 189, 248, 0.25);
+            border-color: #38bdf8;
+            color: #e0f2fe;
+        }}
+
+        /* Modal Dialog */
+        .modal-backdrop {{
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(2, 6, 23, 0.85);
+            backdrop-filter: blur(6px);
+            z-index: 10000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }}
+        .modal-dialog {{
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 12px;
+            width: 100%;
+            max-width: 980px;
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.85);
+            overflow: hidden;
+            animation: modalFadeIn 0.2s ease-out;
+        }}
+        @keyframes modalFadeIn {{
+            from {{ opacity: 0; transform: scale(0.97); }}
+            to {{ opacity: 1; transform: scale(1); }}
+        }}
+        .modal-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 20px;
+            border-bottom: 1px solid #1e293b;
+            background: #1e293b;
+        }}
+        .modal-title {{
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: var(--accent);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .modal-close {{
+            background: none;
+            border: none;
+            color: #94a3b8;
+            font-size: 1.25rem;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 6px;
+            line-height: 1;
+        }}
+        .modal-close:hover {{
+            color: #f87171;
+            background: rgba(239, 68, 68, 0.15);
+        }}
+        .modal-meta-bar {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 14px;
+            padding: 10px 20px;
+            background: #090d16;
+            border-bottom: 1px solid #1e293b;
+            font-size: 0.82rem;
+            color: #94a3b8;
+        }}
+        .modal-meta-item {{
+            display: flex;
+            gap: 5px;
+        }}
+        .modal-meta-label {{
+            color: #64748b;
+        }}
+        .modal-meta-val {{
+            color: #e2e8f0;
+            font-family: monospace;
+            font-weight: 600;
+        }}
+        .modal-toolbar {{
+            display: flex;
+            gap: 8px;
+            padding: 10px 20px;
+            background: #0f172a;
+            border-bottom: 1px solid #1e293b;
+        }}
+        .action-btn {{
+            background: #1e293b;
+            border: 1px solid #334155;
+            color: #e2e8f0;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }}
+        .action-btn:hover {{
+            background: #334155;
+            border-color: #64748b;
+            color: #38bdf8;
+        }}
+        .hex-viewer-body {{
+            padding: 16px 20px;
+            overflow-y: auto;
+            max-height: calc(90vh - 200px);
+            font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+            font-size: 0.84rem;
+            line-height: 1.5;
+            background: #020617;
+            color: #cbd5e1;
+        }}
+        .hex-row {{
+            display: grid;
+            grid-template-columns: 80px 1fr 180px;
+            gap: 16px;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }}
+        .hex-row:hover {{
+            background: rgba(56, 189, 248, 0.08);
+        }}
+        .hex-offset {{
+            color: #64748b;
+            user-select: none;
+        }}
+        .hex-bytes {{
+            color: #e2e8f0;
+            letter-spacing: 1px;
+            white-space: pre;
+        }}
+        .hex-ascii {{
+            color: #38bdf8;
+            border-left: 1px solid #1e293b;
+            padding-left: 10px;
+            white-space: pre;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }}
+
+        /* Database Schema & ER Diagram */
+        .schema-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 16px;
+            margin-top: 16px;
+        }}
+        .schema-card {{
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            transition: transform 0.15s ease, border-color 0.15s ease;
+        }}
+        .schema-card:hover {{
+            border-color: var(--accent);
+            transform: translateY(-2px);
+        }}
+        .schema-card-header {{
+            background: rgba(255, 255, 255, 0.03);
+            border-bottom: 1px solid var(--border-color);
+            padding: 12px 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        .schema-table-title {{
+            font-weight: 700;
+            color: var(--accent);
+            font-size: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }}
+        .schema-cols-list {{
+            padding: 10px 16px;
+            list-style: none;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            max-height: 280px;
+            overflow-y: auto;
+        }}
+        .schema-col-row {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.84rem;
+            padding: 3px 0;
+            border-bottom: 1px dashed rgba(255, 255, 255, 0.05);
+        }}
+        .schema-col-name {{
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }}
+        .badge-pk {{
+            background: rgba(234, 179, 8, 0.2);
+            color: #eab308;
+            border: 1px solid rgba(234, 179, 8, 0.4);
+            font-size: 0.68rem;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-weight: 700;
+        }}
+        .badge-fk {{
+            background: rgba(56, 189, 248, 0.2);
+            color: #38bdf8;
+            border: 1px solid rgba(56, 189, 248, 0.4);
+            font-size: 0.68rem;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-weight: 700;
+        }}
+        .schema-affinity {{
+            color: var(--text-muted);
+            font-family: monospace;
+            font-size: 0.78rem;
+        }}
+        .schema-card-footer {{
+            margin-top: auto;
+            background: rgba(0, 0, 0, 0.15);
+            border-top: 1px solid var(--border-color);
+            padding: 8px 16px;
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            display: flex;
+            justify-content: space-between;
+        }}
+        .mermaid-box {{
+            background: #020617;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            margin-top: 10px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            overflow-x: auto;
+            color: #38bdf8;
+        }}
+
         .footer {{
             margin-top: 30px;
             text-align: center;
@@ -668,6 +1001,9 @@ def generate_html_report(
             </button>
             <button class="tab-btn" id="btn-tab-wal" onclick="switchTab('wal')">
                 <span id="tab-title-wal">⏱️ WAL Transaction Timeline</span> <span class="tab-badge" id="tab-badge-wal">{len(wal_mutations)}</span>
+            </button>
+            <button class="tab-btn" id="btn-tab-schema" onclick="switchTab('schema')">
+                <span id="tab-title-schema">🗂️ Database Schema & ER Diagram</span> <span class="tab-badge" id="tab-badge-schema">{len(schema_tables)}</span>
             </button>
         </div>
 
@@ -876,7 +1212,56 @@ def generate_html_report(
             </div>
         </div>
 
+        <!-- TAB 3: DATABASE SCHEMA & ER DIAGRAM -->
+        <div id="pane-schema" class="tab-pane">
+            <div class="stat-card" style="margin-bottom: 20px; text-align: left; padding: 18px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                    <div>
+                        <h3 style="color: var(--accent); margin-bottom: 6px;" id="txt-schema-title">🗂️ Database Architecture & Entity-Relationship (ER) Topology</h3>
+                        <p style="color: var(--text-secondary); font-size: 0.9rem;" id="txt-schema-desc">
+                            Visual forensic structural layout, primary keys, and cross-table foreign key links discovered via EntityCorrelator.
+                        </p>
+                    </div>
+                    <button class="action-btn" onclick="copyMermaidCode()" id="btnCopyMermaid">
+                        📋 Copy Mermaid ER Code
+                    </button>
+                </div>
+            </div>
 
+            <div id="schemaSummaryCards" class="stats-grid" style="margin-bottom: 20px;"></div>
+
+            <h4 style="color: var(--text-secondary); margin-bottom: 12px; font-size: 1rem;">📑 Tables & Column Affinities</h4>
+            <div id="schemaTablesGrid" class="schema-grid"></div>
+
+            <div style="margin-top: 30px;">
+                <h4 style="color: var(--text-secondary); margin-bottom: 8px; font-size: 1rem;">📐 Mermaid.js Entity-Relationship Model</h4>
+                <div class="mermaid-box" id="mermaidBox">
+                    <pre id="mermaidCodeText" style="margin: 0; white-space: pre-wrap; word-break: break-all;"></pre>
+                </div>
+            </div>
+        </div>
+
+        <!-- HEX & ASCII INSPECTOR MODAL -->
+        <div id="hexModal" class="modal-backdrop" style="display: none;" onclick="if(event.target===this) closeHexModal();">
+            <div class="modal-dialog">
+                <div class="modal-header">
+                    <div class="modal-title">
+                        <span>🔍 Forensic Hex & ASCII Payload Inspector</span>
+                    </div>
+                    <button class="modal-close" onclick="closeHexModal()" title="Close (Esc)">✕</button>
+                </div>
+                <div class="modal-meta-bar" id="hexModalMeta"></div>
+                <div class="modal-toolbar">
+                    <button class="action-btn" onclick="copyHexPayload()">📋 Copy Hex</button>
+                    <button class="action-btn" onclick="copyAsciiPayload()">📝 Copy ASCII</button>
+                    <button class="action-btn" onclick="downloadHexBinary()">💾 Download .bin</button>
+                    <div style="margin-left: auto; display: flex; align-items: center; font-size: 0.8rem; color: #64748b;">
+                        <span>Press <kbd style="background: #1e293b; padding: 2px 6px; border-radius: 4px; color: #94a3b8; border: 1px solid #334155;">Esc</kbd> to exit</span>
+                    </div>
+                </div>
+                <div class="hex-viewer-body" id="hexViewerContainer"></div>
+            </div>
+        </div>
 
         <div class="footer">
             <p>SQLite-Carver-Pro v{__version__} | Author: Dam-FOR3K</p>
@@ -889,6 +1274,7 @@ def generate_html_report(
         const storageData = {storage_payload};
         const integrityData = {integrity_payload};
         const shmData = {shm_payload};
+        const schemaData = {schema_payload};
 
         const I18N = {{
             en: {{
@@ -1247,6 +1633,10 @@ def generate_html_report(
                 const b = document.getElementById('btn-tab-wal'); if (b) b.classList.add('active');
                 document.getElementById('pane-wal').classList.add('active');
                 renderWalTimeline();
+            }} else if (tabId === 'schema') {{
+                const b = document.getElementById('btn-tab-schema'); if (b) b.classList.add('active');
+                document.getElementById('pane-schema').classList.add('active');
+                renderSchemaDiagram();
             }}
         }}
 
@@ -1366,6 +1756,7 @@ def generate_html_report(
                 if (src === 'page_reserved_space' && !itemSrc.includes('reserved_space')) return false;
                 if (src === 'wal' && !itemSrc.includes('wal')) return false;
                 if (src === 'journal' && !itemSrc.includes('journal')) return false;
+                if (src === 'resurrected' && !itemSrc.includes('resurrected')) return false;
 
                 const itemTable = (item.matched_table || item.table_name || '').toLowerCase();
                 if (tbl !== 'all' && itemTable !== tbl.toLowerCase()) return false;
@@ -1425,6 +1816,7 @@ def generate_html_report(
                 else if (source.includes('wal_insert')) badgeClass = 'badge-wal-insert';
                 else if (source.includes('wal_update')) badgeClass = 'badge-wal-update';
                 else if (source.includes('wal_delete')) badgeClass = 'badge-wal-delete';
+                else if (source.includes('resurrected')) badgeClass = 'badge-resurrected';
 
                 let colsHtml = '<div class="columns-container">';
                 if (item.columns) {{
@@ -1482,6 +1874,9 @@ def generate_html_report(
                 }}
                 if (item._evidence_hash) {{
                     extraBadges += ` <span class="hash-badge" title="Record SHA-256: ${{item._evidence_hash}}">🔐 ${{item._evidence_hash.substring(0, 8)}}</span>`;
+                }}
+                if (item.raw_payload_hex && item.raw_payload_hex.length > 0) {{
+                    extraBadges += ` <button class="btn-hex" onclick="openHexModal(${{startIdx + i}})" title="Inspect raw forensic bytes in Hex & ASCII">🔍 Hex</button>`;
                 }}
 
                 rowsHtml += `
@@ -1596,6 +1991,214 @@ def generate_html_report(
                     ${{alertItems}}
                 </div>
             `;
+        }}
+
+        // ==========================================
+        // HEX & ASCII INSPECTOR MODAL
+        // ==========================================
+        let activeHexItem = null;
+
+        function openHexModal(recordIndex) {{
+            const item = currentFilteredData[recordIndex];
+            if (!item) return;
+            activeHexItem = item;
+
+            const hexMeta = document.getElementById('hexModalMeta');
+            const hexContainer = document.getElementById('hexViewerContainer');
+
+            const pageId = item.page_id !== undefined ? item.page_id : '-';
+            const offset = item.offset_in_page !== undefined ? '0x' + item.offset_in_page.toString(16) : '-';
+            const table = item.matched_table || item.table_name || 'Unknown';
+            const rowid = item.rowid !== undefined && item.rowid !== null ? item.rowid : '-';
+            const source = item.source || 'unknown';
+            const hexStr = item.raw_payload_hex || '';
+            const byteLen = Math.floor(hexStr.length / 2);
+
+            hexMeta.innerHTML = `
+                <div class="modal-meta-item"><span class="modal-meta-label">Page:</span> <span class="modal-meta-val">${{escapeHtml(pageId)}}</span></div>
+                <div class="modal-meta-item"><span class="modal-meta-label">Offset:</span> <span class="modal-meta-val">${{escapeHtml(offset)}}</span></div>
+                <div class="modal-meta-item"><span class="modal-meta-label">Table:</span> <span class="modal-meta-val">${{escapeHtml(table)}}</span></div>
+                <div class="modal-meta-item"><span class="modal-meta-label">RowID:</span> <span class="modal-meta-val">${{escapeHtml(rowid)}}</span></div>
+                <div class="modal-meta-item"><span class="modal-meta-label">Source:</span> <span class="modal-meta-val">${{escapeHtml(source)}}</span></div>
+                <div class="modal-meta-item"><span class="modal-meta-label">Size:</span> <span class="modal-meta-val">${{byteLen.toLocaleString()}} bytes</span></div>
+            `;
+
+            let rows = '';
+            if (byteLen === 0) {{
+                rows = '<div style="color: #64748b; padding: 20px; text-align: center;">No raw payload bytes available for this entry.</div>';
+            }} else {{
+                for (let pos = 0; pos < byteLen; pos += 16) {{
+                    const chunkHex = hexStr.substring(pos * 2, Math.min(hexStr.length, (pos + 16) * 2));
+                    const offsetStr = pos.toString(16).padStart(8, '0');
+                    
+                    let byteTokens = [];
+                    let asciiStr = '';
+                    for (let b = 0; b < 16; b++) {{
+                        if (pos + b < byteLen) {{
+                            const bHex = chunkHex.substring(b * 2, b * 2 + 2);
+                            byteTokens.push(bHex);
+                            const byteVal = parseInt(bHex, 16);
+                            asciiStr += (byteVal >= 32 && byteVal <= 126) ? String.fromCharCode(byteVal) : '.';
+                        }} else {{
+                            byteTokens.push('  ');
+                        }}
+                    }}
+                    const hexFormatted = byteTokens.slice(0, 8).join(' ') + '  ' + byteTokens.slice(8).join(' ');
+                    rows += `
+                        <div class="hex-row">
+                            <span class="hex-offset">${{offsetStr}}</span>
+                            <span class="hex-bytes">${{escapeHtml(hexFormatted)}}</span>
+                            <span class="hex-ascii">${{escapeHtml(asciiStr)}}</span>
+                        </div>
+                    `;
+                }}
+            }}
+
+            hexContainer.innerHTML = rows;
+            document.getElementById('hexModal').style.display = 'flex';
+        }}
+
+        function closeHexModal() {{
+            document.getElementById('hexModal').style.display = 'none';
+            activeHexItem = null;
+        }}
+
+        function copyHexPayload() {{
+            if (!activeHexItem || !activeHexItem.raw_payload_hex) return;
+            navigator.clipboard.writeText(activeHexItem.raw_payload_hex).then(() => {{
+                alert('Raw Hex copied to clipboard!');
+            }}).catch(() => {{
+                prompt('Copy Hex:', activeHexItem.raw_payload_hex);
+            }});
+        }}
+
+        function copyAsciiPayload() {{
+            if (!activeHexItem || !activeHexItem.raw_payload_hex) return;
+            const hex = activeHexItem.raw_payload_hex;
+            let ascii = '';
+            for (let i = 0; i < hex.length; i += 2) {{
+                const b = parseInt(hex.substr(i, 2), 16);
+                ascii += (b >= 32 && b <= 126) ? String.fromCharCode(b) : '.';
+            }}
+            navigator.clipboard.writeText(ascii).then(() => {{
+                alert('ASCII Text copied to clipboard!');
+            }}).catch(() => {{
+                prompt('Copy ASCII:', ascii);
+            }});
+        }}
+
+        function downloadHexBinary() {{
+            if (!activeHexItem || !activeHexItem.raw_payload_hex) return;
+            const hex = activeHexItem.raw_payload_hex;
+            const bytes = new Uint8Array(hex.length / 2);
+            for (let i = 0; i < bytes.length; i++) {{
+                bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+            }}
+            const blob = new Blob([bytes], {{ type: 'application/octet-stream' }});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            const page = activeHexItem.page_id || 0;
+            const off = activeHexItem.offset_in_page || 0;
+            a.href = url;
+            a.download = `payload_p${{page}}_off0x${{off.toString(16)}}.bin`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }}
+
+        document.addEventListener('keydown', (e) => {{
+            if (e.key === 'Escape') closeHexModal();
+        }});
+
+        // ==========================================
+        // DATABASE SCHEMA & TOPOLOGY RENDERER
+        // ==========================================
+        function renderSchemaDiagram() {{
+            if (!schemaData || !schemaData.tables) return;
+            const tables = schemaData.tables;
+            const relations = schemaData.relations || [];
+
+            const totalCols = tables.reduce((acc, t) => acc + (t.columns ? t.columns.length : 0), 0);
+            const summaryBox = document.getElementById('schemaSummaryCards');
+            if (summaryBox) {{
+                summaryBox.innerHTML = `
+                    <div class="stat-card">
+                        <div class="label">Tables</div>
+                        <div class="value" style="color: var(--accent);">${{tables.length}}</div>
+                        <div class="sub">Structured Schemas</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="label">Total Columns</div>
+                        <div class="value" style="color: #38bdf8;">${{totalCols}}</div>
+                        <div class="sub">Across All Tables</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="label">Relationships</div>
+                        <div class="value" style="color: #a855f7;">${{relations.length}}</div>
+                        <div class="sub">Foreign Key Links</div>
+                    </div>
+                `;
+            }}
+
+            const grid = document.getElementById('schemaTablesGrid');
+            if (grid) {{
+                let cardsHtml = '';
+                for (const t of tables) {{
+                    let colsHtml = '';
+                    if (t.columns) {{
+                        for (const col of t.columns) {{
+                            let badges = '';
+                            if (col.is_pk) badges += ' <span class="badge-pk">PK</span>';
+                            const isFk = relations.some(r => r.source_table.toLowerCase() === t.name.toLowerCase() && r.source_column.toLowerCase() === col.name.toLowerCase());
+                            if (isFk) badges += ' <span class="badge-fk">FK</span>';
+
+                            colsHtml += `
+                                <li class="schema-col-row">
+                                    <span class="schema-col-name">${{escapeHtml(col.name)}}${{badges}}</span>
+                                    <span class="schema-affinity">${{escapeHtml(col.affinity || 'ANY')}}</span>
+                                </li>
+                            `;
+                        }}
+                    }}
+
+                    cardsHtml += `
+                        <div class="schema-card">
+                            <div class="schema-card-header">
+                                <span class="schema-table-title">🗄️ ${{escapeHtml(t.name)}}</span>
+                                <span style="font-family: monospace; font-size: 0.75rem; color: #64748b;">Root Page: ${{t.root_page || '-'}}</span>
+                            </div>
+                            <ul class="schema-cols-list">
+                                ${{colsHtml}}
+                            </ul>
+                            <div class="schema-card-footer">
+                                <span>${{t.columns ? t.columns.length : 0}} columns</span>
+                                <span>${{t.is_without_rowid ? 'WITHOUT ROWID' : 'RowID Table'}}</span>
+                            </div>
+                        </div>
+                    `;
+                }}
+                grid.innerHTML = cardsHtml;
+            }}
+
+            const mText = document.getElementById('mermaidCodeText');
+            if (mText) {{
+                mText.textContent = schemaData.mermaid || 'erDiagram\\n    %% No tables found';
+            }}
+        }}
+
+        function copyMermaidCode() {{
+            if (!schemaData || !schemaData.mermaid) return;
+            navigator.clipboard.writeText(schemaData.mermaid).then(() => {{
+                const btn = document.getElementById('btnCopyMermaid');
+                if (btn) {{
+                    const orig = btn.innerHTML;
+                    btn.innerHTML = '✅ Copied!';
+                    setTimeout(() => {{ btn.innerHTML = orig; }}, 2000);
+                }}
+            }}).catch(() => {{
+                prompt('Mermaid Code:', schemaData.mermaid);
+            }});
         }}
 
         // Initial render

@@ -8,10 +8,17 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import struct
 import sys
-from pathlib import Path
-from typing import Any, List, Optional
+
+# Ensure parent directory is in sys.path when executed directly (e.g. `py cli.py`)
+if __package__ is None or __package__ == "":
+    _parent = str(Path(__file__).resolve().parent.parent)
+    if _parent not in sys.path:
+        sys.path.insert(0, _parent)
+
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from rich import box
 from rich.console import Console
@@ -57,6 +64,34 @@ def render_banner() -> None:
     console.print(banner)
 
 
+def check_and_decrypt(raw_data: bytes | memoryview, key: Optional[str], fb: Any) -> bytes:
+    """Helper to decrypt SQLCipher database in-memory if a key is provided."""
+    if not key:
+        return bytes(raw_data)
+    try:
+        from sqlite_carver.core.encryption import try_decrypt_database
+        decrypted_bytes, meta = try_decrypt_database(raw_data, key)
+        console.print(
+            f"[bold green]🔓 Successfully decrypted SQLCipher database in-memory![/] "
+            f"[dim]({meta.get('version', 'SQLCipher')}, {meta.get('page_size', 4096)} B/page, {meta.get('pages_decrypted', 0)} pages)[/dim]"
+        )
+        return decrypted_bytes
+    except Exception as e:
+        console.print(f"[bold red]SQLCipher Decryption Error:[/] {e}")
+        fb.close()
+        sys.exit(1)
+
+
+def cmd_gui(args: argparse.Namespace) -> None:
+    """Launches the modern desktop GUI application."""
+    from sqlite_carver.gui.app import launch_gui
+    launch_gui(
+        initial_db=getattr(args, "db_path", None),
+        initial_key=getattr(args, "key", None),
+        lang=getattr(args, "lang", "en"),
+    )
+
+
 def cmd_info(args: argparse.Namespace) -> None:
     """Displays structural forensic metadata about a SQLite database."""
     set_language(getattr(args, "lang", "en"))
@@ -81,8 +116,10 @@ def cmd_info(args: argparse.Namespace) -> None:
             enc_table.add_row("Detected Salt (16B)", f"[dim cyan]{enc_info.salt_hex}[/]")
         for reason in enc_info.reasons:
             enc_table.add_row("Diagnostic", f"[dim]{reason}[/]")
-        console.print(Panel(enc_table, title="[bold red]⚠️ Cryptographic Protection / Encrypted Database Detected[/bold red]", box=box.ROUNDED, border_style="red"))
+        if not getattr(args, "key", None):
+            console.print("[bold yellow]Tip:[/] Use [cyan]--key <passphrase>[/] to decrypt and inspect this SQLCipher database on-the-fly.")
 
+    raw_data = check_and_decrypt(raw_data, getattr(args, "key", None), fb)
     parser = DatabaseParser(raw_data)
     hdr = parser.header
 
@@ -223,10 +260,10 @@ def cmd_carve(args: argparse.Namespace) -> None:
         enc_table.add_row("Shannon Entropy", f"[bold magenta]{enc_info.entropy:.4f} / 8.0000[/]")
         if enc_info.salt_hex:
             enc_table.add_row("Detected Salt (16B)", f"[dim cyan]{enc_info.salt_hex}[/]")
-        for reason in enc_info.reasons:
-            enc_table.add_row("Diagnostic", f"[dim]{reason}[/]")
-        console.print(Panel(enc_table, title="[bold red]⚠️ Cryptographic Protection / Encrypted Database Detected[/bold red]", box=box.ROUNDED, border_style="red"))
+        if not getattr(args, "key", None):
+            console.print("[bold yellow]Tip:[/] Use [cyan]--key <passphrase>[/] to decrypt and carve this SQLCipher database on-the-fly.")
 
+    raw_data = check_and_decrypt(raw_data, getattr(args, "key", None), fb)
     carver = SQLiteCarver(raw_data)
 
     include_active = not args.deleted_only
@@ -585,7 +622,7 @@ def cmd_search(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     fb = ForensicBuffer(db_path)
-    db_data = fb.buffer
+    db_data = check_and_decrypt(fb.buffer, getattr(args, "key", None), fb)
     wal_path = Path(args.wal_path) if args.wal_path else db_path.with_name(db_path.name + "-wal")
     if not wal_path.exists() and db_path.suffix == ".db":
         alt_wal = db_path.with_suffix(".wal")
@@ -809,6 +846,8 @@ Exemples d'utilisation concrets / Concrete usage examples:
 
   9. Chasseur de pages brutes (Raw Page Hunter sur dump RAM ou image disque sans en-tête) :
      sqlite-carver carve-raw dump_memoire.raw --page-size 4096 --export brut.sqlite
+  10. Lancer l'interface graphique moderne (GUI) :
+      sqlite-carver gui [ma_base.db] [--key motdepasse]
 """
 
     parser = argparse.ArgumentParser(
@@ -818,18 +857,29 @@ Exemples d'utilisation concrets / Concrete usage examples:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--gui", action="store_true", help="Launch modern interactive forensic desktop GUI")
+    parser.add_argument("--key", help="SQLCipher passphrase or 64-char raw AES key (hex) to decrypt on-the-fly")
     parser.add_argument("--lang", "-l", choices=["en", "fr"], default="en", help="Language interface (en: English, fr: Français)")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
+
+    # gui
+    p_gui = subparsers.add_parser("gui", help="Launch modern interactive forensic desktop GUI")
+    p_gui.add_argument("db_path", nargs="?", default=None, help="Optional SQLite database file to open immediately")
+    p_gui.add_argument("--key", help="SQLCipher passphrase or 64-char raw AES key (hex) to decrypt on-the-fly")
+    p_gui.add_argument("--lang", "-l", choices=["en", "fr"], default="en", help="Language interface")
+    p_gui.set_defaults(func=cmd_gui)
 
     # info
     p_info = subparsers.add_parser("info", help="Inspect database header, freelists, and schema")
     p_info.add_argument("db_path", help="Path to SQLite database file")
+    p_info.add_argument("--key", help="SQLCipher passphrase or 64-char raw AES key (hex) to decrypt on-the-fly")
     p_info.add_argument("--lang", "-l", choices=["en", "fr"], default="en", help="Language interface")
     p_info.set_defaults(func=cmd_info)
 
     # carve
     p_carve = subparsers.add_parser("carve", help="Carve active and deleted records from database")
     p_carve.add_argument("db_path", help="Path to SQLite database file")
+    p_carve.add_argument("--key", help="SQLCipher passphrase or 64-char raw AES key (hex) to decrypt on-the-fly")
     p_carve.add_argument("--deleted-only", action="store_true", help="Only show carved deleted records (freeblock/slack/unallocated)")
     p_carve.add_argument("--mutations-only", "--diff-only", action="store_true", help="Only show carved records that represent historical mutations/updates of active records")
     p_carve.add_argument("--table", help="Filter by table name")
@@ -857,6 +907,7 @@ Exemples d'utilisation concrets / Concrete usage examples:
     p_search = subparsers.add_parser("search", help="Deep forensic search across active/deleted records, blobs, and WAL")
     p_search.add_argument("db_path", help="Path to SQLite database file")
     p_search.add_argument("query", help="Text keyword or hex string to search for")
+    p_search.add_argument("--key", help="SQLCipher passphrase or 64-char raw AES key (hex) to decrypt on-the-fly")
     p_search.add_argument("--hex", action="store_true", help="Search query as hex byte sequence (e.g. deadbeef)")
     p_search.add_argument("--deleted-only", action="store_true", help="Only search carved deleted records (freeblocks/slack)")
     p_search.add_argument("--table", help="Filter search to specific table name")
@@ -873,6 +924,7 @@ Exemples d'utilisation concrets / Concrete usage examples:
     p_wal = subparsers.add_parser("wal-diff", help="Analyze WAL transaction diffs and timeline")
     p_wal.add_argument("db_path", help="Path to base SQLite database file")
     p_wal.add_argument("wal_path", nargs="?", help="Path to WAL file (defaults to <db_path>-wal)")
+    p_wal.add_argument("--key", help="SQLCipher passphrase or 64-char raw AES key (hex) to decrypt on-the-fly")
     p_wal.add_argument("--table", help="Filter WAL mutations to a specific table")
     p_wal.add_argument("--export", help="Export timeline mutations to (.html, .json, .jsonl)")
     p_wal.add_argument("--lang", "-l", choices=["en", "fr"], default="en", help="Language interface")
@@ -892,6 +944,15 @@ Exemples d'utilisation concrets / Concrete usage examples:
 
     args = parser.parse_args()
     set_language(getattr(args, "lang", "en"))
+
+    if getattr(args, "gui", False) or getattr(args, "command", None) == "gui":
+        cmd_gui(args)
+        return
+
+    if not getattr(args, "command", None):
+        parser.print_help()
+        sys.exit(0)
+
     args.func(args)
 
 

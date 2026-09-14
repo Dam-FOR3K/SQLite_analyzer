@@ -817,6 +817,7 @@ class SQLiteCarver:
         hdr = self.parser.parse_page_header_from_bytes(page_mem, is_page_1=is_page_1)
         records: List[CarvedRecord] = []
         known_offsets: Set[int] = set()
+        encoding = self.parser.header.encoding if (self.parser and self.parser.header) else "utf-8"
 
         # Track exact [start, end) intervals of occupied regions in the page
         occupied_intervals: List[Tuple[int, int]] = []
@@ -982,6 +983,40 @@ class SQLiteCarver:
                             r.details = f"Carved from index '{idx_schema.name}' freeblock ({idx_schema.table_name})"
                         if len(r.values) > len(idx_schema.indexed_columns) and isinstance(r.values[-1], int):
                             r.rowid = r.values[-1]
+
+                    # Fallback healer: if standard record scan found nothing because freeblock pointers
+                    # (first 4 bytes) overwrote the record header, recover trailing payload & rowid
+                    if not fb_records and len(fb.raw_bytes) >= 6:
+                        fb_len = len(fb.raw_bytes)
+                        for r_len in range(1, min(9, fb_len - 4)):
+                            cand_off = fb_len - r_len
+                            v_res = safe_read_varint(fb.raw_bytes, cand_off)
+                            if v_res and v_res[1] == r_len:
+                                cand_rowid = v_res[0]
+                                payload_bytes = fb.raw_bytes[4:cand_off]
+                                try:
+                                    text_val = payload_bytes.decode(encoding)
+                                    if len(text_val) > 0 and all(c.isprintable() or c in "\r\n\t" for c in text_val):
+                                        records.append(
+                                            CarvedRecord(
+                                                page_id=page_id,
+                                                offset_in_page=fb.offset + 4,
+                                                source=fb_src,
+                                                confidence=0.88,
+                                                matched_table=idx_schema.table_name,
+                                                rowid=cand_rowid,
+                                                values=[text_val, cand_rowid],
+                                                column_names=list(idx_schema.indexed_columns) + ["rowid"],
+                                                column_types=["TEXT", "INTEGER"],
+                                                serial_types=[(len(payload_bytes) * 2) + 13, 1],
+                                                raw_payload=bytes(fb.raw_bytes[4:]),
+                                                is_partial=False,
+                                                details=f"Carved from index '{idx_schema.name}' freeblock with overwritten header ({idx_schema.table_name})",
+                                            )
+                                        )
+                                        break
+                                except Exception:
+                                    pass
                 records.extend(fb_records)
 
         # 3. Unallocated Space (Between end of cell pointer array and cell content start)
@@ -1165,6 +1200,90 @@ class SQLiteCarver:
             include_active=include_active,
         )
 
+    def resurrect_records_from_indices(self, records: List[CarvedRecord]) -> List[CarvedRecord]:
+        """
+        Cross-Index-to-Table Record Recovery (FQLite-style forensic enhancement).
+        Examines carved index records (active, freeblocks, slack, unallocated).
+        If an indexed rowid is missing from active table rows (i.e. deleted from table B-Tree,
+        or table leaf was wiped/compacted), reconstructs a partial table record with high confidence.
+        """
+        active_table_rowids = {
+            (r.matched_table, r.rowid)
+            for r in records
+            if r.source == "active" and r.matched_table and r.rowid is not None
+        }
+
+        resurrected: List[CarvedRecord] = []
+        candidates_by_row: Dict[Tuple[str, int], List[CarvedRecord]] = {}
+
+        for r in records:
+            if not r.source.startswith("index_"):
+                continue
+            if not r.matched_table or r.rowid is None:
+                continue
+            if (r.matched_table, r.rowid) in active_table_rowids:
+                continue
+
+            candidates_by_row.setdefault((r.matched_table, r.rowid), []).append(r)
+
+        for (tbl_name, rowid), idx_recs in candidates_by_row.items():
+            tbl_schema = self.schemas.get(tbl_name)
+            if not tbl_schema or not tbl_schema.columns:
+                continue
+
+            col_names = [c.name for c in tbl_schema.columns]
+            col_types = [c.affinity for c in tbl_schema.columns]
+            reconstructed_values: List[Any] = [None] * len(tbl_schema.columns)
+            reconstructed_st: List[int] = [0] * len(tbl_schema.columns)
+            recovered_cols_count = 0
+            contributing_indices: List[str] = []
+
+            # If table has an INTEGER PRIMARY KEY column, assign rowid directly
+            if tbl_schema.pk_col_idx is not None and 0 <= tbl_schema.pk_col_idx < len(reconstructed_values):
+                reconstructed_values[tbl_schema.pk_col_idx] = rowid
+                reconstructed_st[tbl_schema.pk_col_idx] = 1
+                recovered_cols_count += 1
+
+            for ir in idx_recs:
+                idx_schema = self.index_root_map.get(ir.page_id)
+                idx_name = idx_schema.name if idx_schema else "index"
+                contributing_indices.append(idx_name)
+
+                for col_idx, col_name in enumerate(ir.column_names):
+                    if col_name == "rowid":
+                        continue
+                    if col_name in col_names:
+                        target_pos = col_names.index(col_name)
+                        if col_idx < len(ir.values) and reconstructed_values[target_pos] is None:
+                            reconstructed_values[target_pos] = ir.values[col_idx]
+                            if col_idx < len(ir.serial_types):
+                                reconstructed_st[target_pos] = ir.serial_types[col_idx]
+                            recovered_cols_count += 1
+
+            if recovered_cols_count > 0:
+                is_partial = any(v is None for v in reconstructed_values)
+                indices_str = ", ".join(sorted(set(contributing_indices)))
+                primary_idx_rec = idx_recs[0]
+                resurrected.append(
+                    CarvedRecord(
+                        page_id=primary_idx_rec.page_id,
+                        offset_in_page=primary_idx_rec.offset_in_page,
+                        source="resurrected_from_index",
+                        confidence=0.92,
+                        matched_table=tbl_name,
+                        rowid=rowid,
+                        values=reconstructed_values,
+                        column_names=col_names,
+                        column_types=col_types,
+                        serial_types=reconstructed_st,
+                        raw_payload=primary_idx_rec.raw_payload,
+                        is_partial=is_partial,
+                        details=f"Resurrected deleted table row from index ({indices_str}, rowid={rowid})",
+                    )
+                )
+
+        return resurrected
+
     def carve_all(self, include_active: bool = True) -> List[CarvedRecord]:
         """Carves all pages in the database file including active, freelists, and unallocated pages."""
         all_records: List[CarvedRecord] = []
@@ -1210,6 +1329,10 @@ class SQLiteCarver:
                         r.confidence = conf
                         r.column_names = cols
                         r.details += f" (recovered from dropped table '{tbl}')"
+
+        # Resurrect deleted rows from surviving index entries (FQLite forensic enhancement)
+        resurrected_recs = self.resurrect_records_from_indices(all_records)
+        all_records.extend(resurrected_recs)
 
         for r in all_records:
             if not r.evidence_hash:

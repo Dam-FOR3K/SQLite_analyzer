@@ -5,7 +5,7 @@
 [![Platform: Windows | Linux | macOS](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
 [![i18n: EN | FR](https://img.shields.io/badge/language-English%20%7C%20Fran%C3%A7ais-green.svg)]()
 
-**SQLite-Carver-Pro v1.7.0** is an offline digital forensics parser and analysis toolkit engineered to inspect B-Tree structures directly at the binary page level, carve deleted records from table and index pages (`0x0A`, `0x02`), handle R-Tree and FTS virtual tables natively, decode `WITHOUT ROWID` architectures, resurrect dropped tables (`DROP TABLE`) from Page 1 unallocated space, track intelligent record mutations and modifications (`--mutations-only`), detect Shannon entropy and encrypted databases (SQLCipher/SEE), hunt raw B-Tree pages from memory dumps/disk images with multi-core parallel processing (`carve-raw --workers`), analyze WAL shared memory (`.db-shm`), decode multi-format timestamps and GPS coordinates, audit physical page reserved areas (anti-forensics/steganography), guarantee cryptographic chain of custody, carve embedded file BLOBs, and decode nested binary structures (`bplist`, `protobuf`, `zlib`).
+**SQLite-Carver-Pro v1.8.0** is an offline digital forensics parser and analysis toolkit engineered to inspect B-Tree structures directly at the binary page level, carve deleted records from table and index pages (`0x0A`, `0x02`), resurrect deleted records via cross-index correlation (`resurrected_from_index`), handle R-Tree and FTS virtual tables natively, decode `WITHOUT ROWID` architectures, resurrect dropped tables (`DROP TABLE`) from Page 1 unallocated space, track intelligent record mutations and modifications (`--mutations-only`), decrypt SQLCipher (v3/v4 AES-256-CBC) databases on-the-fly (`--key`), provide an interactive modern Dark-Mode Desktop GUI (`sqlite-carver gui`), inspect raw forensic byte payloads via interactive Hex/ASCII modals, render interactive database topology & Mermaid.js ER diagrams, hunt raw B-Tree pages from memory dumps/disk images with multi-core parallel processing (`carve-raw --workers`), analyze WAL shared memory (`.db-shm`), decode multi-format timestamps and GPS coordinates, audit physical page reserved areas (anti-forensics/steganography), guarantee cryptographic chain of custody, carve embedded file BLOBs, and decode nested binary structures (`bplist`, `protobuf`, `zlib`).
 
 ---
 
@@ -27,25 +27,32 @@
 
 1. [Important Verification Notice & Disclaimer](#️-important-verification-notice--disclaimer)
 2. [Core Features](#-core-features)
-3. [Interactive HTML Dashboard Preview](#-interactive-html-dashboard-preview)
-4. [Architecture Overview](#-architecture-overview)
-5. [Installation & Standalone Binary](#-installation--standalone-binary)
-6. [CLI Usage Guide & Previews](#-cli-usage-guide--previews)
+3. [Interactive HTML Dashboard & ER Topology](#-interactive-html-dashboard--er-topology)
+4. [Modern Desktop GUI Application](#-modern-desktop-gui-application)
+5. [Architecture Overview](#-architecture-overview)
+6. [Installation & Standalone Binary](#-installation--standalone-binary)
+7. [CLI Usage Guide & Previews](#-cli-usage-guide--previews)
+   - [0. Interactive Modern GUI (`gui`)](#0-interactive-modern-gui-gui)
    - [1. Database Inspection (`info`)](#1-database-inspection-info)
    - [2. Forensic Deleted Record Carving (`carve`)](#2-forensic-deleted-record-carving-carve)
    - [3. Deep Forensic Search (`search`)](#3-deep-forensic-search-search)
    - [4. WAL Transaction Diffing & Timeline (`wal-diff`)](#4-wal-transaction-diffing--timeline-wal-diff)
    - [5. Embedded BLOB Microscope (`decode-blob`)](#5-embedded-blob-microscope-decode-blob)
    - [6. Raw Page Hunter (`carve-raw`)](#6-raw-page-hunter-carve-raw)
-7. [Supported Export Formats](#-supported-export-formats)
-8. [Python API Quickstart](#-python-api-quickstart)
-9. [Automated Test Suite](#-automated-test-suite)
-10. [Author & Credits](#-author--credits)
+8. [Supported Export Formats](#-supported-export-formats)
+9. [Python API Quickstart](#-python-api-quickstart)
+10. [Automated Test Suite](#-automated-test-suite)
+11. [Author & Credits](#-author--credits)
 
 ---
 
 ## 🚀 Core Features
- 
+
+- **Modern Interactive Desktop GUI (`sqlite-carver gui`)**: High-DPI dark graphite desktop dashboard built with CustomTkinter. Non-blocking multi-threaded carving engine, live forensic metric cards, instant multi-criteria search, table/source filtering, embedded Hex Inspector dialog, and on-the-fly SQLCipher credential entry.
+- **Forensic Hex & ASCII Payload Inspector Modal**: Interactive byte-level inspector available in both Desktop GUI and standalone HTML reports. Formatted 16 bytes/line with hex offsets, ASCII translation column, one-click "Copy Hex", "Copy ASCII", and direct `.bin` raw payload file download.
+- **Database Topology & Mermaid.js ER Diagram**: Dedicated schema analysis tab reconstructing table structures, primary keys, and foreign key relations (`EntityCorrelator`) with interactive table cards and exportable Mermaid.js entity-relationship code.
+- **Cross-Index-to-Table Record Resurrection**: Resurrects deleted table records by joining surviving index entries across multiple indices, merging partial column sets into a unified record (`source="resurrected_from_index"`, confidence 0.92) even when the table cell has been completely purged.
+- **On-the-Fly SQLCipher Decryption Engine (`--key`)**: Automatically fingerprints encrypted databases, derives AES-256 keys via PBKDF2-HMAC-SHA512 (v4) or SHA1 (v3), and decrypts database pages in-memory before carving without writing plaintext to disk. Supports both passphrases and raw 64-char hex keys.
 - **Low-Level B-Tree Parsing**: Full dissection of 100-byte database headers, Table Leaf (`0x0D`), Table Interior (`0x05`), Index Leaf (`0x0A`), and Index Interior (`0x02`) pages.
 - **Intelligent Record Mutation Tracking**: Correlates active and carved historical records sharing the same primary key / rowid to produce an immutable timeline of modifications. Computes field-level granular diffs (`old_value` ➔ `new_value`) and allows isolating altered rows with `--mutations-only`.
 - **Shannon Entropy & SQLCipher / Encryption Assessment**: Computes overall and page-by-page Shannon entropy ($H \in [0, 8]$) to instantly detect encrypted databases (SQLCipher, SEE, wxSQLite3) with high entropy ($\approx 7.95 - 8.00$) or identify hidden encrypted blocks.
@@ -121,7 +128,7 @@ Download `sqlite-carver-v1.7.0.exe` directly from the [`dist/`](./dist/sqlite-ca
 
 ```powershell
 # Check version
-.\sqlite-carver-v1.7.0.exe --version
+.\sqlite-carver.exe --version
 ```
 
 ### Option B: Python Package Installation
@@ -130,16 +137,29 @@ Download `sqlite-carver-v1.7.0.exe` directly from the [`dist/`](./dist/sqlite-ca
 git clone https://github.com/Dam-FOR3K/sqlite-carver-pro.git
 cd sqlite-carver-pro
 
-# Install in editable mode
-pip install -e .
-
-# Or install with parquet support
-pip install -e ".[parquet]"
+# Install in editable mode with GUI and SQLCipher crypto support
+pip install -e ".[all]"
 ```
 
 ---
 
 ## 🖥 CLI Usage Guide & Previews
+
+### 0. Interactive Modern GUI (`gui`)
+Launch the high-DPI dark-mode desktop GUI dashboard with real-time carving, KPI metric cards, and Hex inspector:
+
+```bash
+# 1. Launch standalone GUI dashboard
+sqlite-carver gui
+
+# 2. Launch GUI with immediate database preloading
+sqlite-carver gui evidence.db
+
+# 3. Launch GUI and decrypt SQLCipher database on-the-fly
+sqlite-carver gui encrypted_database.db --key "MySecretPassphrase"
+```
+
+---
 
 ### 1. Database Inspection (`info`)
 Inspect database header flags, page allocation metrics, freelist trunk chains, and discovered schemas:
@@ -148,6 +168,9 @@ Inspect database header flags, page allocation metrics, freelist trunk chains, a
 # English interface (default)
 sqlite-carver info evidence.db
 
+# Decrypt SQLCipher container on-the-fly
+sqlite-carver info encrypted.db --key "MasterKey123"
+
 # French interface
 sqlite-carver info evidence.db --lang fr
 ```
@@ -155,7 +178,7 @@ sqlite-carver info evidence.db --lang fr
 **Terminal Output Preview:**
 ```
 ╔════════════════════════════════════════════════════════════════╗
-║             SQLite-Carver-Pro v1.7.0                           ║
+║             SQLite-Carver-Pro v1.8.0                           ║
 ║  Forensic Parser, Slack Carver, Freelist & WAL Diff Engine     ║
 ╚════════════════════════════════════════════════════════════════╝
 ╭─────────────────────── SQLite Database Header Analysis ────────────────────────╮

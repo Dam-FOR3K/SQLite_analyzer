@@ -103,6 +103,7 @@ def record_to_dict(rec: CarvedRecord) -> Dict[str, Any]:
         }
     if getattr(rec, "evidence_hash", None):
         res["_evidence_hash"] = rec.evidence_hash
+    res["raw_payload_hex"] = rec.raw_payload.hex() if getattr(rec, "raw_payload", None) else ""
     res["is_mutation"] = getattr(rec, "is_mutation", False)
     if getattr(rec, "mutation_diff", None):
         res["mutation_diff"] = serialize_value(rec.mutation_diff)
@@ -214,6 +215,7 @@ def export_html(
     records: List[CarvedRecord | RowMutation],
     output_path: str | Path,
     title: str = "SQLite Forensic Investigation Report",
+    schemas: Optional[Dict[str, Any]] = None,
     storage_breakdown: Optional[Dict[str, Any]] = None,
     integrity_info: Optional[Dict[str, Any]] = None,
     shm_info: Optional[Dict[str, Any]] = None,
@@ -225,6 +227,7 @@ def export_html(
         records,
         output_path,
         title=title,
+        schemas=schemas,
         storage_breakdown=storage_breakdown,
         integrity_info=integrity_info,
         shm_info=shm_info,
@@ -648,6 +651,7 @@ def dispatch_export(
             records,
             path,
             title=title,
+            schemas=schemas,
             storage_breakdown=storage_breakdown,
             integrity_info=integrity_info,
             shm_info=shm_info,
