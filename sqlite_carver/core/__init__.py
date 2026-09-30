@@ -1,6 +1,13 @@
 """Core SQLite parsing, carving, and WAL diff engines."""
 
 from sqlite_carver.core.carver import CarvedRecord, SQLiteCarver, TableSchema
+from sqlite_carver.core.encryption import (
+    analyze_database_encryption,
+    decrypt_see_database,
+    decrypt_sqlcipher_database,
+    decrypt_wal_frame_page,
+    try_decrypt_database,
+)
 from sqlite_carver.core.parser import Cell, DatabaseHeader, DatabaseParser, PageHeader, PageType
 from sqlite_carver.core.search import ForensicSearchEngine, SearchMatch, recursive_search_in_data
 from sqlite_carver.core.varint import decode_serial_value, encode_varint, read_varint, safe_read_varint
@@ -25,6 +32,11 @@ __all__ = [
     "ColumnDiff",
     "RowMutation",
     "WalDiffEngine",
+    "decrypt_wal_frame_page",
+    "try_decrypt_database",
+    "decrypt_sqlcipher_database",
+    "decrypt_see_database",
+    "analyze_database_encryption",
     "ForensicSearchEngine",
     "SearchMatch",
     "recursive_search_in_data",

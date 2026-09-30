@@ -85,3 +85,34 @@ def test_forensic_search_engine_active_and_deleted():
     finally:
         if db_path.exists():
             db_path.unlink()
+
+
+def test_search_reserved_space():
+    import struct
+    from sqlite_carver.core.parser import PageType
+    page_size = 512
+    reserved_sz = 16
+    hdr = bytearray(100)
+    hdr[:16] = b"SQLite format 3\x00"
+    struct.pack_into(">H", hdr, 16, page_size)
+    struct.pack_into(">B", hdr, 18, 1)
+    struct.pack_into(">B", hdr, 19, 1)
+    struct.pack_into(">B", hdr, 20, reserved_sz)
+
+    usable_sz = page_size - reserved_sz
+    page1 = bytearray(hdr)
+    page_hdr = struct.pack(">BHHHB", PageType.TABLE_LEAF.value, 0, 0, usable_sz, 0)
+    page1.extend(page_hdr)
+    page1 = page1.ljust(page_size, b"\x00")
+    page1[usable_sz:usable_sz + 16] = b"StegoPayload123!"
+
+    engine = ForensicSearchEngine(bytes(page1))
+    matches = engine.search("StegoPayload123")
+    assert len(matches) >= 1
+    m = matches[0]
+    assert m.page_id == 1
+    assert m.record_source == "page_reserved_space"
+    assert "StegoPayload123" in m.matched_value_snippet
+
+
+

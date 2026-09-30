@@ -49,3 +49,9 @@ venv.bak/
 *.db-shm
 *.sqlite-wal
 *.sqlite-shm
+
+# External research and reference assets
+Document/
+sqlite_forensic_corpus_v2.0/
+A Practical Hands-on Approach to Database Forensics*.pdf
+

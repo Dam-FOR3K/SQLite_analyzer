@@ -9,9 +9,11 @@ and freelist trunk/leaf structures.
 from __future__ import annotations
 
 import enum
+import mmap
 import struct
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, BinaryIO, Dict, List, Optional, Tuple, Union
 
 from sqlite_carver.core.varint import (
     VarintError,
@@ -20,6 +22,85 @@ from sqlite_carver.core.varint import (
     safe_read_varint,
     serial_type_length,
 )
+
+
+class ForensicBuffer:
+    """
+    Zero-copy memory-mapped file buffer.
+    Maps massive binary files (raw disks, RAM dumps, multi-GB SQLite databases)
+    into process virtual address space with minimal physical RAM overhead.
+    """
+
+    def __init__(self, path: Union[str, Path]):
+        self.path = Path(path)
+        self._file = None
+        self._mmap = None
+        self._mv: Optional[memoryview] = None
+        self.size = 0
+
+        if not self.path.exists():
+            raise FileNotFoundError(f"File not found: {self.path}")
+
+        self.size = self.path.stat().st_size
+        if self.size > 0:
+            try:
+                self._file = open(self.path, "rb")
+                self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+                self._mv = memoryview(self._mmap)
+            except Exception:
+                if self._file and not self._file.closed:
+                    self._file.close()
+                raw = self.path.read_bytes()
+                self._mv = memoryview(raw)
+        else:
+            self._mv = memoryview(b"")
+
+    @property
+    def buffer(self) -> memoryview:
+        return self._mv if self._mv is not None else memoryview(b"")
+
+    def close(self) -> None:
+        if self._mv is not None:
+            try:
+                self._mv.release()
+            except Exception:
+                pass
+            self._mv = None
+        if self._mmap is not None:
+            try:
+                self._mmap.close()
+            except Exception:
+                import gc
+                gc.collect()
+                try:
+                    self._mmap.close()
+                except Exception:
+                    pass
+            self._mmap = None
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
+
+    def __enter__(self) -> memoryview:
+        return self.buffer
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, item):
+        return self.buffer[item]
+
+
+def open_forensic_buffer(path: Union[str, Path]) -> ForensicBuffer:
+    """Convenience helper to create a ForensicBuffer context manager."""
+    return ForensicBuffer(path)
+
 
 
 class PageType(enum.IntEnum):
@@ -69,6 +150,25 @@ class DatabaseHeader:
     @property
     def usable_page_size(self) -> int:
         return self.page_size - self.reserved_space
+
+    @property
+    def has_pointermap(self) -> bool:
+        """True if the database maintains pointermap pages (auto-vacuum or incremental-vacuum enabled)."""
+        return self.largest_root_btree_page > 0
+
+    @property
+    def vacuum_mode(self) -> str:
+        """
+        Forensic vacuum mode determined by header offsets 52 and 64 (Cellebrite Slide 7):
+        - NONE: Auto-vacuum disabled. No pointermap pages exist.
+        - FULL: Full auto-vacuum enabled. Pointermap pages maintained and DB shrinks automatically.
+        - INCREMENTAL: Incremental vacuum enabled. Pointermap pages maintained, truncated via PRAGMA incremental_vacuum.
+        """
+        if self.largest_root_btree_page == 0:
+            return "NONE"
+        if self.incremental_vacuum_flag != 0:
+            return "INCREMENTAL"
+        return "FULL"
 
     @classmethod
     def from_bytes(cls, data: bytes | memoryview) -> "DatabaseHeader":
@@ -278,7 +378,15 @@ def decode_record_payload(
     body_offset = header_size  # Values start immediately after the full header
     
     for st in serial_types:
-        if body_offset >= payload_len:
+        st_len = serial_type_length(st)
+        if st_len > 0 and (body_offset + st_len > payload_len):
+            if allow_partial:
+                values.append(None)
+                col_types.append(f"MISSING_{st}")
+                continue
+            else:
+                break
+        elif body_offset > payload_len:
             if allow_partial:
                 values.append(None)
                 col_types.append(f"MISSING_{st}")
@@ -317,6 +425,46 @@ class DatabaseParser:
         self.reserved_space = self.header.reserved_space if self.header else 0
         self.usable_page_size = self.page_size - self.reserved_space
         self.total_pages = self.size // self.page_size if self.page_size > 0 else 0
+
+    def close(self) -> None:
+        """Explicitly release the underlying memoryview to allow OS file handles to close cleanly."""
+        if hasattr(self, "data") and self.data is not None:
+            try:
+                self.data.release()
+            except Exception:
+                pass
+            self.data = None
+
+    def __enter__(self) -> "DatabaseParser":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    @property
+    def page_count(self) -> int:
+        return self.total_pages
+
+    @property
+    def logical_size(self) -> int:
+        """Returns logical database size in bytes as declared in header (or physical size if 0)."""
+        if self.header and self.header.in_header_db_size_pages > 0:
+            return self.header.in_header_db_size_pages * self.page_size
+        return self.size
+
+    @property
+    def eof_slack_size(self) -> int:
+        """Returns size in bytes of data trailing past the logical database boundary."""
+        log_sz = self.logical_size
+        if self.size > log_sz:
+            return self.size - log_sz
+        return 0
+
+    def get_eof_slack_bytes(self) -> Optional[memoryview]:
+        """Returns the memoryview slice of the EOF slack space if any exists."""
+        if self.eof_slack_size > 0:
+            return self.data[self.logical_size:]
+        return None
 
     def _parse_header(self) -> Optional[DatabaseHeader]:
         if self.size >= 100 and self.data[:16] == b"SQLite format 3\x00":
@@ -567,6 +715,38 @@ class DatabaseParser:
             return []
         return self.get_active_cells_from_bytes(page_data, page_id=page_id, is_page_1=(page_id == 1))
 
+    def get_table_leaf_pages(self, root_page: int) -> List[int]:
+        """
+        Traverses a table B-tree starting at root_page to find all leaf page IDs.
+        If root_page is already a leaf, returns [root_page].
+        Handles multi-level interior pages safely without cycles.
+        """
+        if root_page <= 0 or root_page > self.page_count:
+            return []
+
+        leaves: List[int] = []
+        visited = set()
+        queue = [root_page]
+
+        while queue:
+            pid = queue.pop(0)
+            if pid in visited or pid <= 0 or pid > self.page_count:
+                continue
+            visited.add(pid)
+
+            hdr = self.parse_page_header(pid)
+            if hdr.page_type in (PageType.TABLE_LEAF, PageType.INDEX_LEAF):
+                leaves.append(pid)
+            elif hdr.page_type in (PageType.TABLE_INTERIOR, PageType.INDEX_INTERIOR):
+                cells = self.get_active_cells(pid)
+                for c in cells:
+                    if c.left_child_page and c.left_child_page not in visited:
+                        queue.append(c.left_child_page)
+                if hdr.rightmost_pointer and hdr.rightmost_pointer not in visited:
+                    queue.append(hdr.rightmost_pointer)
+
+        return leaves
+
     def parse_freelist_pages(self) -> List[int]:
         """Traverses the database freelist trunk and leaf hierarchy."""
         if not self.header or self.header.first_freelist_trunk_page == 0:
@@ -597,3 +777,108 @@ class DatabaseParser:
             curr_trunk = next_trunk
 
         return freelist_pages
+
+    def get_all_freelist_pages(self) -> List[int]:
+        """Alias for parse_freelist_pages."""
+        return self.parse_freelist_pages()
+
+    def compute_storage_breakdown(self) -> "StorageBreakdown":
+        """
+        Computes detailed forensic storage allocation across all database pages:
+        active payloads, freeblocks, unallocated page space, fragmented free bytes,
+        and freelist pages.
+        """
+        if not self.header:
+            return StorageBreakdown()
+
+        psize = self.header.page_size
+        tot_pages = self.page_count
+        breakdown = StorageBreakdown(
+            total_pages=tot_pages,
+            page_size=psize,
+            total_bytes=self.size,
+        )
+
+        res_per_page = self.header.reserved_space if self.header else 0
+        breakdown.reserved_space_per_page = res_per_page
+        breakdown.reserved_space_bytes = tot_pages * res_per_page
+
+        freelist_pages = set(self.parse_freelist_pages())
+        breakdown.freelist_pages_count = len(freelist_pages)
+        breakdown.freelist_bytes = len(freelist_pages) * psize
+
+        usable_page_sz = psize - res_per_page
+
+        for pid in range(1, tot_pages + 1):
+            if pid in freelist_pages:
+                continue
+            pdata = self.get_page_bytes(pid)
+            if not pdata:
+                continue
+
+            hdr = self.parse_page_header_from_bytes(pdata, is_page_1=(pid == 1))
+            if hdr.page_type == PageType.UNKNOWN:
+                continue
+
+            # Fragmented free bytes from header offset 7
+            breakdown.fragmented_free_bytes += hdr.fragmented_free_bytes
+
+            # Freeblocks in this page
+            fbs = self.get_freeblocks_from_bytes(pdata, hdr)
+            fb_sum = sum(fb.size for fb in fbs)
+            breakdown.freeblock_bytes += fb_sum
+
+            # Unallocated space between cell pointers and cell_content_offset
+            ptr_end = hdr.header_offset + hdr.header_size + (hdr.cell_count * 2)
+            content_start = hdr.cell_content_offset if hdr.cell_content_offset > 0 else usable_page_sz
+            if content_start > ptr_end:
+                breakdown.unallocated_bytes += (min(content_start, usable_page_sz) - ptr_end)
+
+            # Active cells
+            cells = self.get_active_cells_from_bytes(pdata, page_id=pid, is_page_1=(pid == 1))
+            cell_sum = sum(len(c.raw_cell) for c in cells)
+            breakdown.active_bytes += cell_sum
+
+        breakdown.eof_slack_bytes = self.eof_slack_size
+        return breakdown
+
+
+@dataclass
+class StorageBreakdown:
+    total_pages: int = 0
+    page_size: int = 4096
+    total_bytes: int = 0
+    active_bytes: int = 0
+    freeblock_bytes: int = 0
+    unallocated_bytes: int = 0
+    fragmented_free_bytes: int = 0
+    freelist_bytes: int = 0
+    freelist_pages_count: int = 0
+    eof_slack_bytes: int = 0
+    reserved_space_bytes: int = 0
+    reserved_space_per_page: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_pages": self.total_pages,
+            "page_size": self.page_size,
+            "total_bytes": self.total_bytes,
+            "active_bytes": self.active_bytes,
+            "freeblock_bytes": self.freeblock_bytes,
+            "unallocated_bytes": self.unallocated_bytes,
+            "fragmented_free_bytes": self.fragmented_free_bytes,
+            "freelist_bytes": self.freelist_bytes,
+            "freelist_pages_count": self.freelist_pages_count,
+            "eof_slack_bytes": self.eof_slack_bytes,
+            "reserved_space_bytes": self.reserved_space_bytes,
+            "reserved_space_per_page": self.reserved_space_per_page,
+            "total_slack_bytes": (
+                self.freeblock_bytes
+                + self.unallocated_bytes
+                + self.fragmented_free_bytes
+                + self.freelist_bytes
+                + self.eof_slack_bytes
+                + self.reserved_space_bytes
+            ),
+        }
+

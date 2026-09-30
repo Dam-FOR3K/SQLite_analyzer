@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
+from sqlite_carver import __version__
 from sqlite_carver.core.carver import CarvedRecord
 from sqlite_carver.core.wal_diff import RowMutation
 from sqlite_carver.exporters.export import mutation_to_dict, record_to_dict
@@ -24,8 +26,18 @@ def generate_html_report(
     records: List[Union[CarvedRecord, RowMutation]],
     output_path: str | Path,
     title: str = "SQLite Forensic Investigation Report",
+    schemas: Optional[Dict[str, Any]] = None,
+    storage_breakdown: Optional[Dict[str, Any]] = None,
+    integrity_info: Optional[Dict[str, Any]] = None,
+    shm_info: Optional[Dict[str, Any]] = None,
+    lang: Optional[str] = None,
 ) -> None:
-    """Generates a standalone, interactive HTML forensic dashboard with WAL diff timeline."""
+    """Generates a standalone, interactive HTML forensic dashboard with WAL/Journal diff timeline."""
+    from sqlite_carver.i18n import get_language
+    active_lang = (lang or get_language() or "en").lower()
+    if active_lang not in ("en", "fr"):
+        active_lang = "en"
+
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -43,8 +55,9 @@ def generate_html_report(
             tbl = d["matched_table"] or "Unknown / Unmatched"
         elif isinstance(r, RowMutation):
             d = mutation_to_dict(r)
-            d["_record_kind"] = "wal"
-            src = f"wal_{d['mutation_type'].lower()}"
+            d["_record_kind"] = "journal" if getattr(r, "journal_source", "wal") == "rollback_journal" else "wal"
+            src_prefix = "journal" if getattr(r, "journal_source", "wal") == "rollback_journal" else "wal"
+            src = f"{src_prefix}_{d['mutation_type'].lower()}"
             tbl = d["table_name"] or "Unknown / Unmatched"
             wal_mutations.append(d)
         else:
@@ -56,8 +69,103 @@ def generate_html_report(
         table_stats[tbl] = table_stats.get(tbl, 0) + 1
         serialized_records.append(d)
 
-    json_payload = json.dumps(serialized_records, ensure_ascii=False).replace("</", r"\u003c/")
-    wal_payload = json.dumps(wal_mutations, ensure_ascii=False).replace("</", r"\u003c/")
+    mutations_count = sum(1 for d in serialized_records if d.get("is_mutation"))
+
+    active_table_count = source_stats.get('active', 0)
+    active_index_count = source_stats.get('index_active', 0)
+    total_active_count = active_table_count + active_index_count
+
+    fb_table_count = source_stats.get('freeblock', 0)
+    fb_index_count = source_stats.get('index_freeblock', 0)
+    total_freeblock_count = fb_table_count + fb_index_count
+
+    slack_table_count = source_stats.get('slack', 0) + source_stats.get('unallocated', 0)
+    slack_index_count = source_stats.get('index_slack', 0) + source_stats.get('index_unallocated', 0)
+    total_slack_count = slack_table_count + slack_index_count
+
+    freelist_count = source_stats.get('freelist', 0)
+    reserved_count = source_stats.get('page_reserved_space', 0) + source_stats.get('reserved_space', 0)
+    resurrected_count = source_stats.get('resurrected_from_index', 0)
+
+    schema_tables = []
+    schema_relations = []
+    mermaid_er_code = ""
+
+    if schemas:
+        try:
+            from sqlite_carver.core.correlator import EntityCorrelator
+            correlator = EntityCorrelator(schemas)
+            for link in correlator.fk_links:
+                schema_relations.append({
+                    "source_table": link.source_table,
+                    "source_column": link.source_column,
+                    "target_table": link.target_table,
+                    "target_column": link.target_column,
+                })
+        except Exception:
+            pass
+
+        for tbl_name, s in schemas.items():
+            cols = []
+            pk_idx = getattr(s, "pk_col_idx", None)
+            for i, col in enumerate(getattr(s, "columns", [])):
+                is_pk = (pk_idx is not None and i == pk_idx)
+                cols.append({
+                    "name": col.name,
+                    "affinity": col.affinity,
+                    "is_pk": is_pk,
+                })
+            schema_tables.append({
+                "name": tbl_name,
+                "root_page": getattr(s, "root_page", 0),
+                "sql": getattr(s, "sql", ""),
+                "is_without_rowid": getattr(s, "is_without_rowid", False),
+                "columns": cols,
+            })
+
+        er_lines = ["erDiagram"]
+        for t in schema_tables:
+            t_clean = re.sub(r'[^a-zA-Z0-9_]', '_', t["name"])
+            er_lines.append(f"    {t_clean} {{")
+            for col in t["columns"]:
+                c_clean = re.sub(r'[^a-zA-Z0-9_]', '_', col["name"])
+                aff = col["affinity"] or "TEXT"
+                pk_marker = " PK" if col["is_pk"] else ""
+                er_lines.append(f"        {aff} {c_clean}{pk_marker}")
+            er_lines.append("    }")
+        for r in schema_relations:
+            src = re.sub(r'[^a-zA-Z0-9_]', '_', r["source_table"])
+            tgt = re.sub(r'[^a-zA-Z0-9_]', '_', r["target_table"])
+            col = re.sub(r'[^a-zA-Z0-9_]', '_', r["source_column"])
+            er_lines.append(f'    {tgt} ||--o{{ {src} : "{col}"')
+        mermaid_er_code = "\n".join(er_lines)
+
+    res_b_per_page = 0
+    if storage_breakdown and hasattr(storage_breakdown, 'reserved_space_per_page'):
+        res_b_per_page = storage_breakdown.reserved_space_per_page
+    elif isinstance(storage_breakdown, dict):
+        res_b_per_page = storage_breakdown.get('reserved_space_per_page', 0)
+    
+    if active_lang == "fr":
+        reserved_sub = f"{res_b_per_page} octets/page" if res_b_per_page > 0 else "Stéganographie / Slack"
+    else:
+        reserved_sub = f"{res_b_per_page} B/page" if res_b_per_page > 0 else "Steganography / Slack"
+
+    active_sub = f"Table: {active_table_count:,} | Index: {active_index_count:,}" if active_index_count > 0 else "Allocated Cells"
+    fb_sub = f"Table: {fb_table_count:,} | Index: {fb_index_count:,}" if fb_index_count > 0 else "Deleted Linked Blocks"
+    slack_sub = f"Table: {slack_table_count:,} | Index: {slack_index_count:,}" if slack_index_count > 0 else "Gaps & Margins"
+
+    def json_safe_default(obj: Any) -> Any:
+        if isinstance(obj, (bytes, bytearray, memoryview)):
+            return bytes(obj).hex()
+        return str(obj)
+
+    json_payload = json.dumps(serialized_records, ensure_ascii=False, default=json_safe_default).replace("</", r"\u003c/")
+    wal_payload = json.dumps(wal_mutations, ensure_ascii=False, default=json_safe_default).replace("</", r"\u003c/")
+    storage_payload = json.dumps(storage_breakdown or {}, ensure_ascii=False, default=json_safe_default).replace("</", r"\u003c/")
+    integrity_payload = json.dumps(integrity_info or {}, ensure_ascii=False, default=json_safe_default).replace("</", r"\u003c/")
+    shm_payload = json.dumps(shm_info or {}, ensure_ascii=False, default=json_safe_default).replace("</", r"\u003c/")
+    schema_payload = json.dumps({"tables": schema_tables, "relations": schema_relations, "mermaid": mermaid_er_code}, ensure_ascii=False, default=json_safe_default).replace("</", r"\u003c/")
 
     html_content = f"""<!DOCTYPE html>
 <html lang="fr">
@@ -178,8 +286,8 @@ def generate_html_report(
         /* Stats Grid */
         .stats-grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-            gap: 14px;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
             margin-bottom: 20px;
         }}
 
@@ -189,6 +297,10 @@ def generate_html_report(
             border-radius: 10px;
             padding: 14px;
             text-align: center;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
         }}
 
         .stat-card .label {{
@@ -204,6 +316,13 @@ def generate_html_report(
             font-weight: 700;
             margin-top: 4px;
             color: var(--text-primary);
+        }}
+
+        .stat-card .sub {{
+            font-size: 0.73rem;
+            color: var(--text-secondary);
+            margin-top: 3px;
+            font-weight: 500;
         }}
 
         /* Filter Controls */
@@ -315,6 +434,118 @@ def generate_html_report(
         .badge-wal-insert {{ background-color: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3); }}
         .badge-wal-update {{ background-color: rgba(6, 182, 212, 0.15); color: #22d3ee; border: 1px solid rgba(6, 182, 212, 0.3); }}
         .badge-wal-delete {{ background-color: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }}
+        .badge-journal-insert {{ background-color: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3); }}
+        .badge-journal-update {{ background-color: rgba(14, 165, 233, 0.15); color: #38bdf8; border: 1px solid rgba(14, 165, 233, 0.3); }}
+        .badge-journal-delete {{ background-color: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }}
+        .badge-index-active {{ background-color: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }}
+        .badge-index-freeblock {{ background-color: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }}
+        .badge-index-slack {{ background-color: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }}
+        .badge-index-unallocated {{ background-color: rgba(236, 72, 153, 0.15); color: #f472b6; border: 1px solid rgba(236, 72, 153, 0.3); }}
+        .badge-page-reserved-space {{ background-color: rgba(236, 72, 153, 0.2); color: #f472b6; border: 1px solid rgba(236, 72, 153, 0.4); }}
+
+        /* Geolocation Badges */
+        .geo-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            background: rgba(34, 197, 94, 0.15);
+            border: 1px solid rgba(34, 197, 94, 0.4);
+            color: #4ade80;
+            padding: 1px 7px;
+            border-radius: 4px;
+            font-size: 0.76rem;
+            font-family: monospace;
+            text-decoration: none;
+            margin-left: 6px;
+            transition: background 0.2s;
+        }}
+        .geo-badge:hover {{
+            background: rgba(34, 197, 94, 0.28);
+            text-decoration: underline;
+        }}
+
+        /* Evidence Hash Badges */
+        .hash-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            background: rgba(148, 163, 184, 0.12);
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            color: #94a3b8;
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-size: 0.72rem;
+            font-family: monospace;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+        .hash-badge:hover {{
+            background: rgba(148, 163, 184, 0.25);
+            color: #f8fafc;
+        }}
+
+        /* Foreign Key Badges */
+        .fk-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            background: rgba(56, 189, 248, 0.12);
+            border: 1px solid rgba(56, 189, 248, 0.35);
+            color: #38bdf8;
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-size: 0.76rem;
+            font-family: monospace;
+            margin-left: 6px;
+            cursor: default;
+        }}
+        .fk-badge .arrow {{ color: #94a3b8; font-weight: bold; }}
+        .fk-badge .target {{ font-weight: 600; color: #bae6fd; }}
+
+        /* Storage Breakdown Card */
+        .storage-card {{
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 14px 18px;
+            margin-bottom: 20px;
+        }}
+        .storage-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }}
+        .storage-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 12px;
+        }}
+        .storage-metric {{
+            background: rgba(15, 23, 42, 0.5);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 6px;
+            padding: 10px 14px;
+        }}
+        .storage-metric .lbl {{
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            font-weight: 700;
+        }}
+        .storage-metric .val {{
+            font-size: 1.15rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-top: 3px;
+        }}
+        .storage-metric .sub {{
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 1px;
+        }}
 
         .table-name {{
             color: #e2e8f0;
@@ -465,6 +696,282 @@ def generate_html_report(
             border-radius: 4px;
         }}
 
+        /* Resurrected Badge */
+        .badge-resurrected {{ background-color: rgba(168, 85, 247, 0.2); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.4); }}
+
+        /* Hex Inspector Button */
+        .btn-hex {{
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            background: rgba(56, 189, 248, 0.12);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            color: #38bdf8;
+            padding: 2px 7px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            margin-left: 6px;
+        }}
+        .btn-hex:hover {{
+            background: rgba(56, 189, 248, 0.25);
+            border-color: #38bdf8;
+            color: #e0f2fe;
+        }}
+
+        /* Modal Dialog */
+        .modal-backdrop {{
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(2, 6, 23, 0.85);
+            backdrop-filter: blur(6px);
+            z-index: 10000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }}
+        .modal-dialog {{
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 12px;
+            width: 100%;
+            max-width: 980px;
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.85);
+            overflow: hidden;
+            animation: modalFadeIn 0.2s ease-out;
+        }}
+        @keyframes modalFadeIn {{
+            from {{ opacity: 0; transform: scale(0.97); }}
+            to {{ opacity: 1; transform: scale(1); }}
+        }}
+        .modal-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 20px;
+            border-bottom: 1px solid #1e293b;
+            background: #1e293b;
+        }}
+        .modal-title {{
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: var(--accent);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .modal-close {{
+            background: none;
+            border: none;
+            color: #94a3b8;
+            font-size: 1.25rem;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 6px;
+            line-height: 1;
+        }}
+        .modal-close:hover {{
+            color: #f87171;
+            background: rgba(239, 68, 68, 0.15);
+        }}
+        .modal-meta-bar {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 14px;
+            padding: 10px 20px;
+            background: #090d16;
+            border-bottom: 1px solid #1e293b;
+            font-size: 0.82rem;
+            color: #94a3b8;
+        }}
+        .modal-meta-item {{
+            display: flex;
+            gap: 5px;
+        }}
+        .modal-meta-label {{
+            color: #64748b;
+        }}
+        .modal-meta-val {{
+            color: #e2e8f0;
+            font-family: monospace;
+            font-weight: 600;
+        }}
+        .modal-toolbar {{
+            display: flex;
+            gap: 8px;
+            padding: 10px 20px;
+            background: #0f172a;
+            border-bottom: 1px solid #1e293b;
+        }}
+        .action-btn {{
+            background: #1e293b;
+            border: 1px solid #334155;
+            color: #e2e8f0;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }}
+        .action-btn:hover {{
+            background: #334155;
+            border-color: #64748b;
+            color: #38bdf8;
+        }}
+        .hex-viewer-body {{
+            padding: 16px 20px;
+            overflow-y: auto;
+            max-height: calc(90vh - 200px);
+            font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+            font-size: 0.84rem;
+            line-height: 1.5;
+            background: #020617;
+            color: #cbd5e1;
+        }}
+        .hex-row {{
+            display: grid;
+            grid-template-columns: 80px 1fr 180px;
+            gap: 16px;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }}
+        .hex-row:hover {{
+            background: rgba(56, 189, 248, 0.08);
+        }}
+        .hex-offset {{
+            color: #64748b;
+            user-select: none;
+        }}
+        .hex-bytes {{
+            color: #e2e8f0;
+            letter-spacing: 1px;
+            white-space: pre;
+        }}
+        .hex-ascii {{
+            color: #38bdf8;
+            border-left: 1px solid #1e293b;
+            padding-left: 10px;
+            white-space: pre;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }}
+
+        /* Database Schema & ER Diagram */
+        .schema-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 16px;
+            margin-top: 16px;
+        }}
+        .schema-card {{
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            transition: transform 0.15s ease, border-color 0.15s ease;
+        }}
+        .schema-card:hover {{
+            border-color: var(--accent);
+            transform: translateY(-2px);
+        }}
+        .schema-card-header {{
+            background: rgba(255, 255, 255, 0.03);
+            border-bottom: 1px solid var(--border-color);
+            padding: 12px 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        .schema-table-title {{
+            font-weight: 700;
+            color: var(--accent);
+            font-size: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }}
+        .schema-cols-list {{
+            padding: 10px 16px;
+            list-style: none;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            max-height: 280px;
+            overflow-y: auto;
+        }}
+        .schema-col-row {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.84rem;
+            padding: 3px 0;
+            border-bottom: 1px dashed rgba(255, 255, 255, 0.05);
+        }}
+        .schema-col-name {{
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }}
+        .badge-pk {{
+            background: rgba(234, 179, 8, 0.2);
+            color: #eab308;
+            border: 1px solid rgba(234, 179, 8, 0.4);
+            font-size: 0.68rem;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-weight: 700;
+        }}
+        .badge-fk {{
+            background: rgba(56, 189, 248, 0.2);
+            color: #38bdf8;
+            border: 1px solid rgba(56, 189, 248, 0.4);
+            font-size: 0.68rem;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-weight: 700;
+        }}
+        .schema-affinity {{
+            color: var(--text-muted);
+            font-family: monospace;
+            font-size: 0.78rem;
+        }}
+        .schema-card-footer {{
+            margin-top: auto;
+            background: rgba(0, 0, 0, 0.15);
+            border-top: 1px solid var(--border-color);
+            padding: 8px 16px;
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            display: flex;
+            justify-content: space-between;
+        }}
+        .mermaid-box {{
+            background: #020617;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            margin-top: 10px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            overflow-x: auto;
+            color: #38bdf8;
+        }}
+
         .footer {{
             margin-top: 30px;
             text-align: center;
@@ -489,41 +996,125 @@ def generate_html_report(
 
         <!-- Navigation Tabs -->
         <div class="tabs-nav">
-            <button class="tab-btn active" onclick="switchTab('evidence')">
+            <button class="tab-btn active" id="btn-tab-evidence" onclick="switchTab('evidence')">
                 <span id="tab-title-evidence">📋 All Evidence</span> <span class="tab-badge" id="tab-badge-evidence">{len(serialized_records)}</span>
             </button>
-            <button class="tab-btn" onclick="switchTab('wal')">
+            <button class="tab-btn" id="btn-tab-wal" onclick="switchTab('wal')">
                 <span id="tab-title-wal">⏱️ WAL Transaction Timeline</span> <span class="tab-badge" id="tab-badge-wal">{len(wal_mutations)}</span>
+            </button>
+            <button class="tab-btn" id="btn-tab-schema" onclick="switchTab('schema')">
+                <span id="tab-title-schema">🗂️ Database Schema & ER Diagram</span> <span class="tab-badge" id="tab-badge-schema">{len(schema_tables)}</span>
             </button>
         </div>
 
         <!-- TAB 1: ALL EVIDENCE -->
         <div id="pane-evidence" class="tab-pane active">
+            <!-- Anti-Forensics Anomaly Alerts Banner -->
+            <div id="antiForensicsBanner" style="display: none; margin-bottom: 20px;"></div>
+
             <!-- Stats Grid -->
             <div class="stats-grid">
-                <div class="stat-card">
+                <div class="stat-card" style="cursor: pointer;" onclick="document.getElementById('sourceFilter').value='all'; applyFilters();" title="Click to show all records">
                     <div class="label" id="lbl-total-records">Total Records</div>
-                    <div class="value">{len(serialized_records)}</div>
+                    <div class="value">{len(serialized_records):,}</div>
+                    <div class="sub">All Evidence</div>
                 </div>
-                <div class="stat-card">
+                <div class="stat-card" style="cursor: pointer;" onclick="document.getElementById('sourceFilter').value='active'; applyFilters();" title="Click to filter by active records">
                     <div class="label" id="lbl-active">Active</div>
-                    <div class="value" style="color: var(--color-active);">{source_stats.get('active', 0)}</div>
+                    <div class="value" style="color: var(--color-active);">{total_active_count:,}</div>
+                    <div class="sub">{active_sub}</div>
                 </div>
-                <div class="stat-card">
+                <div class="stat-card" style="cursor: pointer;" onclick="document.getElementById('sourceFilter').value='mutations'; applyFilters();" title="Click to filter by mutated records">
+                    <div class="label" id="lbl-mutations">Mutations / Diffs</div>
+                    <div class="value" style="color: #eab308;">{mutations_count:,}</div>
+                    <div class="sub">Active vs Carved</div>
+                </div>
+                <div class="stat-card" style="cursor: pointer;" onclick="document.getElementById('sourceFilter').value='freeblock'; applyFilters();" title="Click to filter by freeblocks">
                     <div class="label" id="lbl-freeblocks">Freeblocks</div>
-                    <div class="value" style="color: var(--color-freeblock);">{source_stats.get('freeblock', 0)}</div>
+                    <div class="value" style="color: var(--color-freeblock);">{total_freeblock_count:,}</div>
+                    <div class="sub">{fb_sub}</div>
                 </div>
-                <div class="stat-card">
-                    <div class="label" id="lbl-freelist">Freelist Pages</div>
-                    <div class="value" style="color: var(--color-freelist);">{source_stats.get('freelist', 0)}</div>
+                <div class="stat-card" style="cursor: pointer;" onclick="document.getElementById('sourceFilter').value='freelist'; applyFilters();" title="Click to filter by freelist records">
+                    <div class="label" id="lbl-freelist">Freelist Records</div>
+                    <div class="value" style="color: var(--color-freelist);">{freelist_count:,}</div>
+                    <div class="sub" id="sub-freelist"></div>
                 </div>
-                <div class="stat-card">
+                <div class="stat-card" style="cursor: pointer;" onclick="document.getElementById('sourceFilter').value='slack'; applyFilters();" title="Click to filter by slack & unallocated">
                     <div class="label" id="lbl-slack">Slack & Unallocated</div>
-                    <div class="value" style="color: var(--color-slack);">{source_stats.get('slack', 0) + source_stats.get('unallocated', 0)}</div>
+                    <div class="value" style="color: var(--color-slack);">{total_slack_count:,}</div>
+                    <div class="sub">{slack_sub}</div>
                 </div>
-                <div class="stat-card">
-                    <div class="label" id="lbl-wal">WAL Mutations</div>
-                    <div class="value" style="color: var(--color-wal);">{len(wal_mutations)}</div>
+                <div class="stat-card" style="cursor: pointer;" onclick="document.getElementById('sourceFilter').value='page_reserved_space'; applyFilters();" title="Click to filter by page reserved space">
+                    <div class="label" id="lbl-reserved">Page Reserved Space</div>
+                    <div class="value" style="color: #ec4899;">{reserved_count:,}</div>
+                    <div class="sub" id="sub-reserved">{reserved_sub}</div>
+                </div>
+                <div class="stat-card" style="cursor: pointer;" onclick="document.getElementById('sourceFilter').value='wal'; applyFilters();" title="Click to filter by WAL / Journal">
+                    <div class="label" id="lbl-wal">WAL & Journal</div>
+                    <div class="value" style="color: var(--color-wal);">{len(wal_mutations):,}</div>
+                    <div class="sub">Transaction Logs</div>
+                </div>
+            </div>
+
+            <!-- File Integrity & Hashes Card -->
+            <div id="integrityCard" class="storage-card" style="display: none;">
+                <div class="storage-header">
+                    <span id="lbl-integrity-title">🔐 Cryptographic Chain of Custody & File Integrity Hashes</span>
+                </div>
+                <div id="integrityGrid" style="display: flex; flex-direction: column; gap: 6px; font-family: monospace; font-size: 0.82rem; color: var(--text-secondary);"></div>
+            </div>
+
+            <!-- WAL Shared Memory (.db-shm) Card -->
+            <div id="shmCard" class="storage-card" style="display: none;">
+                <div class="storage-header">
+                    <span id="lbl-shm-title">⚡ WAL Shared Memory Index (.db-shm) Diagnostics</span>
+                    <span id="shmSummary" style="font-size: 0.85rem; color: var(--text-secondary);"></span>
+                </div>
+                <div class="storage-grid" id="shmGrid"></div>
+            </div>
+
+            <!-- Storage & Slack Allocation Breakdown -->
+            <div id="storageBreakdownCard" class="storage-card" style="display: none;">
+                <div class="storage-header">
+                    <span id="lbl-storage-title">📊 Storage Allocation & Forensic Slack Breakdown</span>
+                    <span id="storageTotalPages" style="font-size: 0.85rem; color: var(--text-secondary);"></span>
+                </div>
+                <div class="storage-grid">
+                    <div class="storage-metric">
+                        <div class="lbl" id="lbl-storage-active">Active Data</div>
+                        <div class="val" id="storageActiveVal" style="color: var(--color-active);">-</div>
+                        <div class="sub" id="sub-storage-active">Allocated B-Tree Cells</div>
+                    </div>
+                    <div class="storage-metric">
+                        <div class="lbl" id="lbl-storage-freeblock">Freeblocks</div>
+                        <div class="val" id="storageFreeblockVal" style="color: var(--color-freeblock);">-</div>
+                        <div class="sub" id="sub-storage-freeblock">Deleted Linked Blocks</div>
+                    </div>
+                    <div class="storage-metric">
+                        <div class="lbl" id="lbl-storage-unalloc">Unallocated Space</div>
+                        <div class="val" id="storageUnallocVal" style="color: var(--color-unallocated);">-</div>
+                        <div class="sub" id="sub-storage-unalloc">Cell Pointer Gaps</div>
+                    </div>
+                    <div class="storage-metric">
+                        <div class="lbl" id="lbl-storage-frag">Fragmented Free Slack</div>
+                        <div class="val" id="storageFragVal" style="color: var(--color-slack);">-</div>
+                        <div class="sub" id="sub-storage-frag">Page Header Offset 7</div>
+                    </div>
+                    <div class="storage-metric">
+                        <div class="lbl" id="lbl-storage-freelist">Freelist Pages</div>
+                        <div class="val" id="storageFreelistVal" style="color: var(--color-freelist);">-</div>
+                        <div class="sub" id="sub-storage-freelist">Trunk & Leaf Pages</div>
+                    </div>
+                    <div class="storage-metric" id="storageReservedMetric">
+                        <div class="lbl" id="lbl-storage-reserved">Reserved Space</div>
+                        <div class="val" id="storageReservedVal" style="color: #ec4899;">-</div>
+                        <div class="sub" id="sub-storage-reserved">Steganography / Anti-Forensics</div>
+                    </div>
+                    <div class="storage-metric">
+                        <div class="lbl" id="lbl-storage-totalslack">Total Forensic Slack</div>
+                        <div class="val" id="storageTotalSlackVal" style="color: #38bdf8;">-</div>
+                        <div class="sub" id="sub-storage-totalslack">Recoverable / Deleted Volume</div>
+                    </div>
                 </div>
             </div>
 
@@ -537,13 +1128,16 @@ def generate_html_report(
                     <label for="sourceFilter" id="lbl-source-filter">Source:</label>
                     <select id="sourceFilter">
                         <option value="all">All Sources</option>
+                        <option value="mutations">🔄 Mutations / Modified Rows Only (Diffs)</option>
                         <option value="active">Active Cells</option>
-                        <option value="deleted">Deleted Only (Freeblock, Freelist, Slack, WAL)</option>
+                        <option value="deleted">Deleted Only (Freeblock, Freelist, Slack, Journals)</option>
                         <option value="freeblock">Freeblocks</option>
-                        <option value="freelist">Freelist Pages</option>
+                        <option value="freelist">Freelist Records</option>
                         <option value="slack">Slack Space</option>
                         <option value="unallocated">Unallocated</option>
+                        <option value="page_reserved_space">🛡️ Page Reserved Space (Steganography)</option>
                         <option value="wal">WAL Transactions</option>
+                        <option value="journal">Rollback Journal</option>
                     </select>
                 </div>
 
@@ -618,42 +1212,138 @@ def generate_html_report(
             </div>
         </div>
 
+        <!-- TAB 3: DATABASE SCHEMA & ER DIAGRAM -->
+        <div id="pane-schema" class="tab-pane">
+            <div class="stat-card" style="margin-bottom: 20px; text-align: left; padding: 18px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                    <div>
+                        <h3 style="color: var(--accent); margin-bottom: 6px;" id="txt-schema-title">🗂️ Database Architecture & Entity-Relationship (ER) Topology</h3>
+                        <p style="color: var(--text-secondary); font-size: 0.9rem;" id="txt-schema-desc">
+                            Visual forensic structural layout, primary keys, and cross-table foreign key links discovered via EntityCorrelator.
+                        </p>
+                    </div>
+                    <button class="action-btn" onclick="copyMermaidCode()" id="btnCopyMermaid">
+                        📋 Copy Mermaid ER Code
+                    </button>
+                </div>
+            </div>
+
+            <div id="schemaSummaryCards" class="stats-grid" style="margin-bottom: 20px;"></div>
+
+            <h4 style="color: var(--text-secondary); margin-bottom: 12px; font-size: 1rem;">📑 Tables & Column Affinities</h4>
+            <div id="schemaTablesGrid" class="schema-grid"></div>
+
+            <div style="margin-top: 30px;">
+                <h4 style="color: var(--text-secondary); margin-bottom: 8px; font-size: 1rem;">📐 Mermaid.js Entity-Relationship Model</h4>
+                <div class="mermaid-box" id="mermaidBox">
+                    <pre id="mermaidCodeText" style="margin: 0; white-space: pre-wrap; word-break: break-all;"></pre>
+                </div>
+            </div>
+        </div>
+
+        <!-- HEX & ASCII INSPECTOR MODAL -->
+        <div id="hexModal" class="modal-backdrop" style="display: none;" onclick="if(event.target===this) closeHexModal();">
+            <div class="modal-dialog">
+                <div class="modal-header">
+                    <div class="modal-title">
+                        <span>🔍 Forensic Hex & ASCII Payload Inspector</span>
+                    </div>
+                    <button class="modal-close" onclick="closeHexModal()" title="Close (Esc)">✕</button>
+                </div>
+                <div class="modal-meta-bar" id="hexModalMeta"></div>
+                <div class="modal-toolbar">
+                    <button class="action-btn" onclick="copyHexPayload()">📋 Copy Hex</button>
+                    <button class="action-btn" onclick="copyAsciiPayload()">📝 Copy ASCII</button>
+                    <button class="action-btn" onclick="downloadHexBinary()">💾 Download .bin</button>
+                    <div style="margin-left: auto; display: flex; align-items: center; font-size: 0.8rem; color: #64748b;">
+                        <span>Press <kbd style="background: #1e293b; padding: 2px 6px; border-radius: 4px; color: #94a3b8; border: 1px solid #334155;">Esc</kbd> to exit</span>
+                    </div>
+                </div>
+                <div class="hex-viewer-body" id="hexViewerContainer"></div>
+            </div>
+        </div>
+
         <div class="footer">
-            <p>SQLite-Carver-Pro v1.3.0 | Author: Dam-FOR3K</p>
+            <p>SQLite-Carver-Pro v{__version__} | Author: Dam-FOR3K</p>
         </div>
     </div>
 
     <script>
         const rawData = {json_payload};
         const walData = {wal_payload};
+        const storageData = {storage_payload};
+        const integrityData = {integrity_payload};
+        const shmData = {shm_payload};
+        const schemaData = {schema_payload};
 
         const I18N = {{
             en: {{
                 flag: "🇫🇷",
                 langBtn: "Français",
-                subtitle: "Forensic Database Reconstruction, Deleted Record Recovery & WAL Transaction Diff",
+                subtitle: "Forensic Database Reconstruction, Deleted Record Recovery & WAL / Journal Transaction Diff",
                 tabEvidence: "📋 All Evidence",
-                tabWal: "⏱️ WAL Transaction Timeline",
+                tabWal: "⏱️ WAL & Journal Timeline",
                 totalRecords: "Total Records",
                 active: "Active",
+                mutations: "Mutations / Diffs",
                 freeblocks: "Freeblocks",
-                freelist: "Freelist Pages",
+                freelist: "Freelist Records",
+                freelistPagesSub: (p) => `${{p.toLocaleString()}} ${{p === 1 ? 'page' : 'pages'}}`,
                 slack: "Slack & Unallocated",
-                walMutations: "WAL Mutations",
+                reserved: "Page Reserved Space",
+                reservedSub: (b) => b > 0 ? `${{b}} B/page` : "Steganography / Slack",
+                walMutations: "WAL & Journal",
+
+                integrityTitle: "🔐 Cryptographic Chain of Custody & File Integrity Hashes",
+                
+                shmTitle: "⚡ WAL Shared Memory Index (.db-shm) Diagnostics",
+                shmActiveReaders: "active reader(s)",
+                shmPageSize: "Page Size",
+                shmPageSizeSub: "SHM Header",
+                shmMaxWalFrame: "Max WAL Frame",
+                shmMaxWalFrameSub: "WAL Index mxFrame",
+                shmDatabasePages: "Database Pages",
+                shmDatabasePagesSub: "SHM nPage",
+                shmCheckpointSeq: "Checkpoint Seq",
+                shmCheckpointSeqSub: "aFrame[0]",
+                shmCheckpointBackfill: "Checkpoint Backfill",
+                shmCheckpointBackfillSub: "aFrame[1]",
+
+                storageTitle: "📊 Storage Allocation & Forensic Slack Breakdown",
+                storageActive: "Active Data",
+                storageActiveSub: "Allocated B-Tree Cells",
+                storageFreeblocks: "Freeblocks",
+                storageFreeblocksSub: "Deleted Linked Blocks",
+                storageUnalloc: "Unallocated Space",
+                storageUnallocSub: "Cell Pointer Gaps",
+                storageFrag: "Fragmented Free Slack",
+                storageFragSub: "Page Header Offset 7",
+                storageFreelist: "Freelist Pages",
+                storageFreelistSub: "Trunk & Leaf Pages",
+                storageReserved: "Reserved Space",
+                storageReservedSub: "Per-page Anti-Forensics / Steganography",
+                storageTotalSlack: "Total Forensic Slack",
+                storageTotalSlackSub: "Recoverable / Deleted Volume",
+
                 searchPlaceholder: "Search keywords, flags, emails, tokens (instant live search)...",
                 sourceLabel: "Source:",
                 sourceAll: "All Sources",
+                sourceMutations: "🔄 Mutations / Modified Rows Only (Diffs)",
                 sourceActive: "Active Cells",
-                sourceDeleted: "Deleted Only (Freeblock, Freelist, Slack, WAL)",
+                sourceDeleted: "Deleted Only (Freeblock, Freelist, Slack, Journals)",
                 sourceFreeblock: "Freeblocks",
-                sourceFreelist: "Freelist Pages",
+                sourceFreelist: "Freelist Records",
                 sourceSlack: "Slack Space",
                 sourceUnallocated: "Unallocated",
+                sourceReserved: "🛡️ Page Reserved Space (Steganography)",
                 sourceWal: "WAL Transactions",
+                sourceJournal: "Rollback Journal",
                 tableLabel: "Table:",
                 tableAll: "All Tables",
                 minConf: "Min Confidence",
                 rowsPerPage: "Rows per page:",
+                btnPrev: "◀ Prev",
+                btnNext: "Next ▶",
                 thPage: "Page",
                 thOffset: "Offset",
                 thSource: "Source",
@@ -661,58 +1351,101 @@ def generate_html_report(
                 thTable: "Table",
                 thRowId: "RowID",
                 thColumns: "Reconstructed Columns & Decoded Payloads",
-                walTitle: "⏱️ Write-Ahead Log (WAL) Chronological Transaction Diff",
-                walDesc: "Reconstructs exact transaction order, column modifications, and deleted rows prior to WAL checkpoints.",
-                noWal: "No WAL transactions recorded or no companion WAL file was present.",
+                walTitle: "⏱️ Chronological Transaction Diff (WAL & Rollback Journal)",
+                walDesc: "Reconstructs exact transaction order, column modifications, and deleted rows from WAL frames and Rollback Journal records.",
+                noWal: "No WAL or Rollback Journal transactions recorded.",
                 noRecords: "No matching records found.",
                 showingRecords: (s, e, t) => `Showing ${{s}}-${{e}} of ${{t.toLocaleString()}} records`,
                 showingZero: "Showing 0 records",
                 pageOf: (c, t) => `Page ${{c}} / ${{t}}`,
+                afAlertTitle: "Anti-Forensics & Tampering Anomalies Detected",
             }},
             fr: {{
                 flag: "🇬🇧",
                 langBtn: "English",
-                subtitle: "Reconstruction Forensique, Carving de Cellules Supprimées & Diff WAL",
+                subtitle: "Reconstruction Forensique, Carving de Cellules Supprimées & Diff WAL / Journal",
                 tabEvidence: "📋 Toutes les Preuves",
-                tabWal: "⏱️ Timeline des Transactions WAL",
+                tabWal: "⏱️ Timeline WAL & Journal",
                 totalRecords: "Total Enregistrements",
                 active: "Actifs",
+                mutations: "Mutations / Diffs",
                 freeblocks: "Freeblocks",
-                freelist: "Pages Freelist",
+                freelist: "Enregistrements Freelist",
+                freelistPagesSub: (p) => `${{p.toLocaleString()}} ${{p === 1 || p === 0 ? 'page' : 'pages'}}`,
                 slack: "Slack & Non-Alloué",
-                walMutations: "Mutations WAL",
+                reserved: "Espace Réservé",
+                reservedSub: (b) => b > 0 ? `${{b}} octets/page` : "Stéganographie / Slack",
+                walMutations: "WAL & Journal",
+
+                integrityTitle: "🔐 Chaîne de Garde Cryptographique & Intégrité des Fichiers",
+
+                shmTitle: "⚡ Diagnostic de la Mémoire Partagée WAL (.db-shm)",
+                shmActiveReaders: "lecteur(s) actif(s)",
+                shmPageSize: "Taille de Page",
+                shmPageSizeSub: "En-tête SHM",
+                shmMaxWalFrame: "Frame WAL Max",
+                shmMaxWalFrameSub: "Index WAL mxFrame",
+                shmDatabasePages: "Pages de Base",
+                shmDatabasePagesSub: "SHM nPage",
+                shmCheckpointSeq: "Séquence Checkpoint",
+                shmCheckpointSeqSub: "aFrame[0]",
+                shmCheckpointBackfill: "Remplissage Checkpoint",
+                shmCheckpointBackfillSub: "aFrame[1]",
+
+                storageTitle: "📊 Répartition du Stockage & Slack Forensique",
+                storageActive: "Données Actives",
+                storageActiveSub: "Cellules B-Tree Allouées",
+                storageFreeblocks: "Freeblocks",
+                storageFreeblocksSub: "Blocs Chaînés Supprimés",
+                storageUnalloc: "Espace Non-Alloué",
+                storageUnallocSub: "Intervalles de Pointeurs",
+                storageFrag: "Slack Fragmenté",
+                storageFragSub: "En-tête de Page Offset 7",
+                storageFreelist: "Pages Freelist",
+                storageFreelistSub: "Pages Troncs & Feuilles",
+                storageReserved: "Espace Réservé",
+                storageReservedSub: "Stéganographie / Anti-Forensics",
+                storageTotalSlack: "Total Slack Forensique",
+                storageTotalSlackSub: "Volume Récupérable / Supprimé",
+
                 searchPlaceholder: "Rechercher mots-clés, tokens, emails, flags (recherche instantanée)...",
                 sourceLabel: "Source :",
                 sourceAll: "Toutes les sources",
+                sourceMutations: "🔄 Mutations / Lignes Modifiées (Diffs)",
                 sourceActive: "Cellules Actives",
-                sourceDeleted: "Supprimés uniquement (Freeblock, Freelist, Slack, WAL)",
+                sourceDeleted: "Supprimés uniquement (Freeblock, Freelist, Slack, Journaux)",
                 sourceFreeblock: "Freeblocks",
-                sourceFreelist: "Pages Freelist",
+                sourceFreelist: "Enregistrements Freelist",
                 sourceSlack: "Slack Space",
                 sourceUnallocated: "Espace Non-Alloué",
+                sourceReserved: "🛡️ Espace Réservé (Stéganographie)",
                 sourceWal: "Transactions WAL",
+                sourceJournal: "Journal Rollback",
                 tableLabel: "Table :",
                 tableAll: "Toutes les tables",
                 minConf: "Confiance Min",
                 rowsPerPage: "Lignes par page :",
+                btnPrev: "◀ Préc",
+                btnNext: "Suiv ▶",
                 thPage: "Page",
                 thOffset: "Offset",
                 thSource: "Source",
                 thConf: "Conf.",
                 thTable: "Table",
                 thRowId: "RowID",
-                thColumns: "Colonnes Reconstituées & Payloads Décodés",
-                walTitle: "⏱️ Journal Write-Ahead Log (WAL) — Diff Chronologique des Transactions",
-                walDesc: "Reconstitue l'ordre exact des transactions, les modifications de colonnes et les lignes supprimées avant checkpoint.",
-                noWal: "Aucune transaction WAL enregistrée ou aucun fichier compagnon .db-wal présent.",
+                thColumns: "Colonnes Reconstruites & Données Décodées",
+                walTitle: "⏱️ Chronologie des Transactions (WAL & Rollback Journal)",
+                walDesc: "Reconstitue l'historique des transactions, colonnes modifiées et lignes supprimées depuis les trames WAL et journaux rollback.",
+                noWal: "Aucune transaction WAL ou Rollback Journal enregistrée.",
                 noRecords: "Aucun enregistrement correspondant trouvé.",
                 showingRecords: (s, e, t) => `Affichage ${{s}}-${{e}} sur ${{t.toLocaleString()}} enregistrements`,
                 showingZero: "Affichage 0 enregistrement",
                 pageOf: (c, t) => `Page ${{c}} sur ${{t}}`,
+                afAlertTitle: "Anomalies Anti-Forensics & Altérations Détectées",
             }}
         }};
 
-        let currentLang = 'en';
+        let currentLang = '{active_lang}';
 
         function toggleLanguage() {{
             currentLang = currentLang === 'en' ? 'fr' : 'en';
@@ -729,16 +1462,74 @@ def generate_html_report(
             
             document.getElementById('lbl-total-records').textContent = lang.totalRecords;
             document.getElementById('lbl-active').textContent = lang.active;
+            const lblMut = document.getElementById('lbl-mutations'); if (lblMut) lblMut.textContent = lang.mutations;
             document.getElementById('lbl-freeblocks').textContent = lang.freeblocks;
             document.getElementById('lbl-freelist').textContent = lang.freelist;
+            const subFl = document.getElementById('sub-freelist');
+            if (subFl) {{
+                const flCount = (typeof storageData !== 'undefined' && storageData && storageData.freelist_pages_count !== undefined) ? storageData.freelist_pages_count : null;
+                subFl.textContent = (flCount !== null) ? lang.freelistPagesSub(flCount) : '';
+            }}
             document.getElementById('lbl-slack').textContent = lang.slack;
+            const lblRes = document.getElementById('lbl-reserved');
+            if (lblRes) lblRes.textContent = lang.reserved;
+            const subRes = document.getElementById('sub-reserved');
+            if (subRes) {{
+                const resB = (typeof storageData !== 'undefined' && storageData && storageData.reserved_space_per_page !== undefined) ? storageData.reserved_space_per_page : 0;
+                subRes.textContent = lang.reservedSub(resB);
+            }}
             document.getElementById('lbl-wal').textContent = lang.walMutations;
+
+            // Integrity Card
+            const lblIntegrity = document.getElementById('lbl-integrity-title');
+            if (lblIntegrity) lblIntegrity.textContent = lang.integrityTitle;
+
+            // SHM Card
+            const lblShm = document.getElementById('lbl-shm-title');
+            if (lblShm) lblShm.textContent = lang.shmTitle;
+
+            // Storage Breakdown Card
+            const lblStorage = document.getElementById('lbl-storage-title');
+            if (lblStorage) lblStorage.textContent = lang.storageTitle;
+            if (document.getElementById('lbl-storage-active')) document.getElementById('lbl-storage-active').textContent = lang.storageActive;
+            if (document.getElementById('sub-storage-active')) document.getElementById('sub-storage-active').textContent = lang.storageActiveSub;
+            if (document.getElementById('lbl-storage-freeblock')) document.getElementById('lbl-storage-freeblock').textContent = lang.storageFreeblocks;
+            if (document.getElementById('sub-storage-freeblock')) document.getElementById('sub-storage-freeblock').textContent = lang.storageFreeblocksSub;
+            if (document.getElementById('lbl-storage-unalloc')) document.getElementById('lbl-storage-unalloc').textContent = lang.storageUnalloc;
+            if (document.getElementById('sub-storage-unalloc')) document.getElementById('sub-storage-unalloc').textContent = lang.storageUnallocSub;
+            if (document.getElementById('lbl-storage-frag')) document.getElementById('lbl-storage-frag').textContent = lang.storageFrag;
+            if (document.getElementById('sub-storage-frag')) document.getElementById('sub-storage-frag').textContent = lang.storageFragSub;
+            if (document.getElementById('lbl-storage-freelist')) document.getElementById('lbl-storage-freelist').textContent = lang.storageFreelist;
+            if (document.getElementById('sub-storage-freelist')) document.getElementById('sub-storage-freelist').textContent = lang.storageFreelistSub;
+            if (document.getElementById('lbl-storage-reserved')) document.getElementById('lbl-storage-reserved').textContent = lang.storageReserved;
+            if (document.getElementById('sub-storage-reserved')) document.getElementById('sub-storage-reserved').textContent = lang.storageReservedSub;
+            if (document.getElementById('lbl-storage-totalslack')) document.getElementById('lbl-storage-totalslack').textContent = lang.storageTotalSlack;
+            if (document.getElementById('sub-storage-totalslack')) document.getElementById('sub-storage-totalslack').textContent = lang.storageTotalSlackSub;
             
             document.getElementById('searchInput').placeholder = lang.searchPlaceholder;
             document.getElementById('lbl-source-filter').textContent = lang.sourceLabel;
             document.getElementById('lbl-table-filter').textContent = lang.tableLabel;
             document.getElementById('lbl-min-conf').textContent = lang.minConf;
             document.getElementById('lbl-rows-per-page').textContent = lang.rowsPerPage;
+
+            // Source Filter Options
+            const optAll = document.querySelector('#sourceFilter option[value="all"]'); if (optAll) optAll.textContent = lang.sourceAll;
+            const optMut = document.querySelector('#sourceFilter option[value="mutations"]'); if (optMut) optMut.textContent = lang.sourceMutations;
+            const optAct = document.querySelector('#sourceFilter option[value="active"]'); if (optAct) optAct.textContent = lang.sourceActive;
+            const optDel = document.querySelector('#sourceFilter option[value="deleted"]'); if (optDel) optDel.textContent = lang.sourceDeleted;
+            const optFb = document.querySelector('#sourceFilter option[value="freeblock"]'); if (optFb) optFb.textContent = lang.sourceFreeblock;
+            const optFl = document.querySelector('#sourceFilter option[value="freelist"]'); if (optFl) optFl.textContent = lang.sourceFreelist;
+            const optSl = document.querySelector('#sourceFilter option[value="slack"]'); if (optSl) optSl.textContent = lang.sourceSlack;
+            const optUn = document.querySelector('#sourceFilter option[value="unallocated"]'); if (optUn) optUn.textContent = lang.sourceUnallocated;
+            const optRes = document.querySelector('#sourceFilter option[value="page_reserved_space"]'); if (optRes) optRes.textContent = lang.sourceReserved;
+            const optWal = document.querySelector('#sourceFilter option[value="wal"]'); if (optWal) optWal.textContent = lang.sourceWal;
+            const optJ = document.querySelector('#sourceFilter option[value="journal"]'); if (optJ) optJ.textContent = lang.sourceJournal;
+
+            const optTblAll = document.querySelector('#tableFilter option[value="all"]'); if (optTblAll) optTblAll.textContent = lang.tableAll;
+
+            // Pagination Buttons
+            const btnPrev = document.getElementById('btnPrevPage'); if (btnPrev) btnPrev.textContent = lang.btnPrev;
+            const btnNext = document.getElementById('btnNextPage'); if (btnNext) btnNext.textContent = lang.btnNext;
             
             document.getElementById('th-page').textContent = lang.thPage;
             document.getElementById('th-offset').textContent = lang.thOffset;
@@ -750,6 +1541,70 @@ def generate_html_report(
             
             document.getElementById('txt-wal-title').textContent = lang.walTitle;
             document.getElementById('txt-wal-desc').textContent = lang.walDesc;
+
+            if (integrityData && Object.keys(integrityData).length > 0) {{
+                const card = document.getElementById('integrityCard');
+                const grid = document.getElementById('integrityGrid');
+                let hasEntries = false;
+                grid.innerHTML = '';
+                for (const [k, v] of Object.entries(integrityData)) {{
+                    if (v && v.sha256) {{
+                        hasEntries = true;
+                        grid.innerHTML += `<div style="display: flex; flex-wrap: wrap; justify-content: space-between; padding: 4px 8px; background: rgba(15,23,42,0.4); border-radius: 4px;">
+                            <span><strong>${{escapeHtml(v.filename || k)}}</strong> (${{v.size_bytes ? v.size_bytes.toLocaleString() : 0}} B):</span>
+                            <span>SHA-256: <code style="color:#4ade80;">${{v.sha256}}</code> | MD5: <code style="color:#94a3b8;">${{v.md5}}</code></span>
+                        </div>`;
+                    }}
+                }}
+                if (hasEntries) card.style.display = 'block';
+            }}
+
+            if (shmData && shmData.has_shm) {{
+                const scard = document.getElementById('shmCard');
+                const sgrid = document.getElementById('shmGrid');
+                scard.style.display = 'block';
+                document.getElementById('shmSummary').textContent = `${{shmData.active_readers_count}} ${{lang.shmActiveReaders}}`;
+                sgrid.innerHTML = `
+                    <div class="storage-metric"><div class="lbl">${{lang.shmPageSize}}</div><div class="val" style="color:var(--accent);">${{shmData.page_size}} B</div><div class="sub">${{lang.shmPageSizeSub}}</div></div>
+                    <div class="storage-metric"><div class="lbl">${{lang.shmMaxWalFrame}}</div><div class="val" style="color:var(--color-wal);">${{shmData.max_wal_frame.toLocaleString()}}</div><div class="sub">${{lang.shmMaxWalFrameSub}}</div></div>
+                    <div class="storage-metric"><div class="lbl">${{lang.shmDatabasePages}}</div><div class="val" style="color:var(--color-active);">${{shmData.database_pages.toLocaleString()}}</div><div class="sub">${{lang.shmDatabasePagesSub}}</div></div>
+                    <div class="storage-metric"><div class="lbl">${{lang.shmCheckpointSeq}}</div><div class="val" style="color:var(--color-slack);">${{shmData.checkpoint_sequence}}</div><div class="sub">${{lang.shmCheckpointSeqSub}}</div></div>
+                    <div class="storage-metric"><div class="lbl">${{lang.shmCheckpointBackfill}}</div><div class="val" style="color:var(--color-freelist);">${{shmData.checkpoint_backfill}}</div><div class="sub">${{lang.shmCheckpointBackfillSub}}</div></div>
+                `;
+            }}
+
+            if (storageData && storageData.total_pages) {{
+                document.getElementById('storageBreakdownCard').style.display = 'block';
+                const fmtB = (b) => {{
+                    if (!b || b === 0) return '0 B';
+                    const k = 1024;
+                    const sizes = ['B', 'KB', 'MB', 'GB'];
+                    const i = Math.floor(Math.log(b) / Math.log(k));
+                    return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+                }};
+                document.getElementById('storageTotalPages').textContent = `${{storageData.total_pages.toLocaleString()}} pages (${{fmtB(storageData.total_bytes)}})`;
+                document.getElementById('storageActiveVal').textContent = fmtB(storageData.active_bytes);
+                document.getElementById('storageFreeblockVal').textContent = fmtB(storageData.freeblock_bytes);
+                document.getElementById('storageUnallocVal').textContent = fmtB(storageData.unallocated_bytes);
+                document.getElementById('storageFragVal').textContent = fmtB(storageData.fragmented_free_bytes);
+                document.getElementById('storageFreelistVal').textContent = `${{storageData.freelist_pages_count}} pgs (${{fmtB(storageData.freelist_bytes)}})`;
+                const resMetric = document.getElementById('storageReservedMetric');
+                if (resMetric) {{
+                    const resBytes = storageData.reserved_space_bytes || 0;
+                    const resPerPg = storageData.reserved_space_per_page || 0;
+                    const resValEl = document.getElementById('storageReservedVal');
+                    if (resValEl) {{
+                        if (resBytes > 0) {{
+                            resValEl.textContent = `${{resPerPg}} B/pg (${{fmtB(resBytes)}})`;
+                            resValEl.style.color = '#ec4899';
+                        }} else {{
+                            resValEl.textContent = '0 B';
+                            resValEl.style.color = 'var(--text-secondary)';
+                        }}
+                    }}
+                }}
+                document.getElementById('storageTotalSlackVal').textContent = fmtB(storageData.total_slack_bytes);
+            }}
 
             renderPage();
             renderWalTimeline();
@@ -771,13 +1626,17 @@ def generate_html_report(
             document.querySelectorAll('.tab-pane').forEach(pane => pane.classList.remove('active'));
             
             if (tabId === 'evidence') {{
-                document.querySelectorAll('.tab-btn')[0].classList.add('active');
+                const b = document.getElementById('btn-tab-evidence'); if (b) b.classList.add('active');
                 document.getElementById('pane-evidence').classList.add('active');
                 applyFilters();
-            }} else {{
-                document.querySelectorAll('.tab-btn')[1].classList.add('active');
+            }} else if (tabId === 'wal') {{
+                const b = document.getElementById('btn-tab-wal'); if (b) b.classList.add('active');
                 document.getElementById('pane-wal').classList.add('active');
                 renderWalTimeline();
+            }} else if (tabId === 'schema') {{
+                const b = document.getElementById('btn-tab-schema'); if (b) b.classList.add('active');
+                document.getElementById('pane-schema').classList.add('active');
+                renderSchemaDiagram();
             }}
         }}
 
@@ -886,13 +1745,18 @@ def generate_html_report(
                 if (item.confidence !== undefined && item.confidence < minConf) return false;
                 
                 const itemSrc = (item.source || (item.mutation_type ? `wal_${{item.mutation_type.toLowerCase()}}` : '')).toLowerCase();
-                if (src === 'active' && itemSrc !== 'active') return false;
-                if (src === 'deleted' && itemSrc === 'active') return false;
+                const isActive = itemSrc.includes('active');
+                if (src === 'mutations' && !item.is_mutation) return false;
+                if (src === 'active' && !isActive) return false;
+                if (src === 'deleted' && isActive) return false;
                 if (src === 'freeblock' && !itemSrc.includes('freeblock')) return false;
                 if (src === 'freelist' && !itemSrc.includes('freelist')) return false;
-                if (src === 'slack' && !itemSrc.includes('slack')) return false;
+                if (src === 'slack' && (!itemSrc.includes('slack') && !itemSrc.includes('unallocated'))) return false;
                 if (src === 'unallocated' && !itemSrc.includes('unallocated')) return false;
+                if (src === 'page_reserved_space' && !itemSrc.includes('reserved_space')) return false;
                 if (src === 'wal' && !itemSrc.includes('wal')) return false;
+                if (src === 'journal' && !itemSrc.includes('journal')) return false;
+                if (src === 'resurrected' && !itemSrc.includes('resurrected')) return false;
 
                 const itemTable = (item.matched_table || item.table_name || '').toLowerCase();
                 if (tbl !== 'all' && itemTable !== tbl.toLowerCase()) return false;
@@ -931,32 +1795,51 @@ def generate_html_report(
                 const item = pageRecords[i];
                 const pageId = item.page_id !== undefined ? item.page_id : '-';
                 const offset = item.offset_in_page !== undefined ? '0x' + item.offset_in_page.toString(16) : '-';
-                const source = item.source || (item.mutation_type ? `wal_${{item.mutation_type.toLowerCase()}}` : 'unknown');
+                const source = item.source || (item.mutation_type ? `${{item.journal_source || 'wal'}}_${{item.mutation_type.toLowerCase()}}` : 'unknown');
                 const conf = item.confidence !== undefined ? item.confidence.toFixed(2) : '1.00';
                 const table = item.matched_table || item.table_name || '?';
                 const rowid = item.rowid !== undefined && item.rowid !== null ? item.rowid : '?';
 
                 let badgeClass = 'badge-active';
-                if (source.includes('freeblock')) badgeClass = 'badge-freeblock';
+                if (source.includes('index_active')) badgeClass = 'badge-index-active';
+                else if (source.includes('index_freeblock')) badgeClass = 'badge-index-freeblock';
+                else if (source.includes('index_slack')) badgeClass = 'badge-index-slack';
+                else if (source.includes('index_unallocated')) badgeClass = 'badge-index-unallocated';
+                else if (source.includes('freeblock')) badgeClass = 'badge-freeblock';
                 else if (source.includes('freelist')) badgeClass = 'badge-freelist';
                 else if (source.includes('slack')) badgeClass = 'badge-slack';
                 else if (source.includes('unallocated')) badgeClass = 'badge-unallocated';
+                else if (source.includes('reserved_space')) badgeClass = 'badge-page-reserved-space';
+                else if (source.includes('journal_insert')) badgeClass = 'badge-journal-insert';
+                else if (source.includes('journal_update')) badgeClass = 'badge-journal-update';
+                else if (source.includes('journal_delete')) badgeClass = 'badge-journal-delete';
                 else if (source.includes('wal_insert')) badgeClass = 'badge-wal-insert';
                 else if (source.includes('wal_update')) badgeClass = 'badge-wal-update';
                 else if (source.includes('wal_delete')) badgeClass = 'badge-wal-delete';
+                else if (source.includes('resurrected')) badgeClass = 'badge-resurrected';
 
                 let colsHtml = '<div class="columns-container">';
                 if (item.columns) {{
                     for (const [k, v] of Object.entries(item.columns)) {{
+                        let diffBadge = '';
+                        if (item.mutation_diff && item.mutation_diff[k]) {{
+                            const dVal = item.mutation_diff[k];
+                            diffBadge = ` <span title="Current active row had '${{escapeHtml(String(dVal.active))}}'" style="display:inline-block; font-size:0.75rem; background:rgba(234,179,8,0.2); color:#eab308; border:1px solid rgba(234,179,8,0.4); border-radius:3px; padding:0 4px; margin-left:4px; font-weight:600;">🔄 Active: ${{renderValue(dVal.active, query)}}</span>`;
+                        }}
                         let tsBadge = '';
                         if (item._timestamps && item._timestamps[k]) {{
                             const ts = item._timestamps[k];
                             tsBadge = ` <span title="${{escapeHtml(ts.description)}}" style="display:inline-block; font-size:0.75rem; background:rgba(56,189,248,0.15); color:#38bdf8; border:1px solid rgba(56,189,248,0.3); border-radius:3px; padding:0 4px; margin-left:4px; font-family: monospace;">📅 ${{escapeHtml(ts.iso_utc)}}</span>`;
                         }}
+                        let fkBadge = '';
+                        if (item._foreign_keys && item._foreign_keys[k]) {{
+                            const fk = item._foreign_keys[k];
+                            fkBadge = ` <span class="fk-badge" title="Resolved Foreign Key: ${{escapeHtml(fk.target_table)}}.${{escapeHtml(fk.target_column)}} = ${{fk.target_id}}"><span class="arrow">➔</span> <span class="target">${{escapeHtml(fk.target_table)}}:</span> <strong>${{escapeHtml(fk.display_value)}}</strong></span>`;
+                        }}
                         colsHtml += `
                             <div class="col-row">
                                 <span class="col-label">${{escapeHtml(k)}}:</span>
-                                <span class="col-val">${{renderValue(v, query)}}${{tsBadge}}</span>
+                                <span class="col-val">${{renderValue(v, query)}}${{diffBadge}}${{fkBadge}}${{tsBadge}}</span>
                             </div>
                         `;
                     }}
@@ -981,6 +1864,21 @@ def generate_html_report(
                 }}
                 colsHtml += '</div>';
 
+                let extraBadges = '';
+                if (item.is_mutation) {{
+                    extraBadges += ` <span class="badge" style="background: rgba(234,179,8,0.2); color: #eab308; border: 1px solid rgba(234,179,8,0.4); font-weight: bold;">🔄 HISTORICAL MUTATION (DIFF)</span>`;
+                }}
+                if (item._geo) {{
+                    const altStr = (item._geo.altitude !== null && item._geo.altitude !== undefined) ? ` (${{item._geo.altitude}}m)` : '';
+                    extraBadges += ` <a href="${{escapeHtml(item._geo.url)}}" target="_blank" rel="noopener noreferrer" class="geo-badge" title="Open GPS location in OpenStreetMap">📍 ${{item._geo.latitude.toFixed(5)}}, ${{item._geo.longitude.toFixed(5)}}${{altStr}}</a>`;
+                }}
+                if (item._evidence_hash) {{
+                    extraBadges += ` <span class="hash-badge" title="Record SHA-256: ${{item._evidence_hash}}">🔐 ${{item._evidence_hash.substring(0, 8)}}</span>`;
+                }}
+                if (item.raw_payload_hex && item.raw_payload_hex.length > 0) {{
+                    extraBadges += ` <button class="btn-hex" onclick="openHexModal(${{startIdx + i}})" title="Inspect raw forensic bytes in Hex & ASCII">🔍 Hex</button>`;
+                }}
+
                 rowsHtml += `
                     <tr>
                         <td style="color: var(--text-muted);">${{pageId}}</td>
@@ -989,7 +1887,7 @@ def generate_html_report(
                         <td style="font-weight: 600;">${{conf}}</td>
                         <td><span class="table-name">${{escapeHtml(table)}}</span></td>
                         <td style="color: var(--accent);">${{rowid}}</td>
-                        <td>${{colsHtml}}</td>
+                        <td>${{colsHtml}}${{extraBadges ? `<div style="margin-top: 6px;">${{extraBadges}}</div>` : ''}}</td>
                     </tr>
                 `;
             }}
@@ -1043,10 +1941,17 @@ def generate_html_report(
                     diffContentHtml = `<div class="diff-grid"><div class="diff-row"><span style="color: #f87171;">- Row deleted:</span> ${{escapeHtml(JSON.stringify(mut.old_values))}}</div></div>`;
                 }}
 
+                const isJournal = mut.journal_source === 'rollback_journal';
+                const srcLabel = isJournal ? 'Rollback Journal' : 'WAL';
+                const srcBadge = isJournal 
+                    ? '<span class="badge" style="background: rgba(14, 165, 233, 0.2); color: #38bdf8; border: 1px solid rgba(14, 165, 233, 0.4);">ROLLBACK JOURNAL</span>' 
+                    : '<span class="badge" style="background: rgba(6, 182, 212, 0.2); color: #22d3ee; border: 1px solid rgba(6, 182, 212, 0.4);">WAL</span>';
+
                 timelineHtml += `
                     <div class="timeline-item ${{typeClass}}">
                         <div class="timeline-header">
-                            <span class="timeline-frame">Frame #${{mut.frame_index}} (Page ${{mut.page_id}})</span>
+                            <span class="timeline-frame">${{srcLabel}} Frame #${{mut.frame_index}} (Page ${{mut.page_id}})</span>
+                            ${{srcBadge}}
                             <span class="badge badge-${{typeClass}}">${{type}}</span>
                             ${{isCommitBadge}}
                             ${{walOnlyBadge}}
@@ -1062,8 +1967,244 @@ def generate_html_report(
             listContainer.innerHTML = timelineHtml;
         }}
 
+        // ==========================================
+        // ANTI-FORENSICS & TAMPERING ALERT BANNER
+        // ==========================================
+        function renderAntiForensicsBanner() {{
+            if (!integrityData || !integrityData.anomalies || integrityData.anomalies.length === 0) return;
+            const banner = document.getElementById('antiForensicsBanner');
+            if (!banner) return;
+
+            banner.style.display = 'block';
+            let alertItems = integrityData.anomalies.map(a => `
+                <div style="margin-top: 6px; padding: 10px 14px; background: rgba(0,0,0,0.25); border-radius: 6px; border-left: 3px solid ${{a.severity === 'HIGH' ? '#ef4444' : '#f59e0b'}};">
+                    <strong style="color: ${{a.severity === 'HIGH' ? '#f87171' : '#fbbf24'}};">[${{a.severity}}] ${{escapeHtml(a.title)}}</strong>
+                    <div style="color: var(--text-secondary); font-size: 0.85rem; margin-top: 3px;">${{escapeHtml(a.details)}}</div>
+                </div>
+            `).join('');
+
+            banner.innerHTML = `
+                <div style="background: rgba(239, 68, 68, 0.12); border: 1px solid #ef4444; border-radius: 8px; padding: 14px 18px;">
+                    <div style="display: flex; align-items: center; gap: 8px; color: #ef4444; font-weight: 700; font-size: 1.05rem;">
+                        <span>⚠️</span> <span>${{I18N[currentLang].afAlertTitle}}</span> (${{integrityData.anomalies.length}})
+                    </div>
+                    ${{alertItems}}
+                </div>
+            `;
+        }}
+
+        // ==========================================
+        // HEX & ASCII INSPECTOR MODAL
+        // ==========================================
+        let activeHexItem = null;
+
+        function openHexModal(recordIndex) {{
+            const item = currentFilteredData[recordIndex];
+            if (!item) return;
+            activeHexItem = item;
+
+            const hexMeta = document.getElementById('hexModalMeta');
+            const hexContainer = document.getElementById('hexViewerContainer');
+
+            const pageId = item.page_id !== undefined ? item.page_id : '-';
+            const offset = item.offset_in_page !== undefined ? '0x' + item.offset_in_page.toString(16) : '-';
+            const table = item.matched_table || item.table_name || 'Unknown';
+            const rowid = item.rowid !== undefined && item.rowid !== null ? item.rowid : '-';
+            const source = item.source || 'unknown';
+            const hexStr = item.raw_payload_hex || '';
+            const byteLen = Math.floor(hexStr.length / 2);
+
+            hexMeta.innerHTML = `
+                <div class="modal-meta-item"><span class="modal-meta-label">Page:</span> <span class="modal-meta-val">${{escapeHtml(pageId)}}</span></div>
+                <div class="modal-meta-item"><span class="modal-meta-label">Offset:</span> <span class="modal-meta-val">${{escapeHtml(offset)}}</span></div>
+                <div class="modal-meta-item"><span class="modal-meta-label">Table:</span> <span class="modal-meta-val">${{escapeHtml(table)}}</span></div>
+                <div class="modal-meta-item"><span class="modal-meta-label">RowID:</span> <span class="modal-meta-val">${{escapeHtml(rowid)}}</span></div>
+                <div class="modal-meta-item"><span class="modal-meta-label">Source:</span> <span class="modal-meta-val">${{escapeHtml(source)}}</span></div>
+                <div class="modal-meta-item"><span class="modal-meta-label">Size:</span> <span class="modal-meta-val">${{byteLen.toLocaleString()}} bytes</span></div>
+            `;
+
+            let rows = '';
+            if (byteLen === 0) {{
+                rows = '<div style="color: #64748b; padding: 20px; text-align: center;">No raw payload bytes available for this entry.</div>';
+            }} else {{
+                for (let pos = 0; pos < byteLen; pos += 16) {{
+                    const chunkHex = hexStr.substring(pos * 2, Math.min(hexStr.length, (pos + 16) * 2));
+                    const offsetStr = pos.toString(16).padStart(8, '0');
+                    
+                    let byteTokens = [];
+                    let asciiStr = '';
+                    for (let b = 0; b < 16; b++) {{
+                        if (pos + b < byteLen) {{
+                            const bHex = chunkHex.substring(b * 2, b * 2 + 2);
+                            byteTokens.push(bHex);
+                            const byteVal = parseInt(bHex, 16);
+                            asciiStr += (byteVal >= 32 && byteVal <= 126) ? String.fromCharCode(byteVal) : '.';
+                        }} else {{
+                            byteTokens.push('  ');
+                        }}
+                    }}
+                    const hexFormatted = byteTokens.slice(0, 8).join(' ') + '  ' + byteTokens.slice(8).join(' ');
+                    rows += `
+                        <div class="hex-row">
+                            <span class="hex-offset">${{offsetStr}}</span>
+                            <span class="hex-bytes">${{escapeHtml(hexFormatted)}}</span>
+                            <span class="hex-ascii">${{escapeHtml(asciiStr)}}</span>
+                        </div>
+                    `;
+                }}
+            }}
+
+            hexContainer.innerHTML = rows;
+            document.getElementById('hexModal').style.display = 'flex';
+        }}
+
+        function closeHexModal() {{
+            document.getElementById('hexModal').style.display = 'none';
+            activeHexItem = null;
+        }}
+
+        function copyHexPayload() {{
+            if (!activeHexItem || !activeHexItem.raw_payload_hex) return;
+            navigator.clipboard.writeText(activeHexItem.raw_payload_hex).then(() => {{
+                alert('Raw Hex copied to clipboard!');
+            }}).catch(() => {{
+                prompt('Copy Hex:', activeHexItem.raw_payload_hex);
+            }});
+        }}
+
+        function copyAsciiPayload() {{
+            if (!activeHexItem || !activeHexItem.raw_payload_hex) return;
+            const hex = activeHexItem.raw_payload_hex;
+            let ascii = '';
+            for (let i = 0; i < hex.length; i += 2) {{
+                const b = parseInt(hex.substr(i, 2), 16);
+                ascii += (b >= 32 && b <= 126) ? String.fromCharCode(b) : '.';
+            }}
+            navigator.clipboard.writeText(ascii).then(() => {{
+                alert('ASCII Text copied to clipboard!');
+            }}).catch(() => {{
+                prompt('Copy ASCII:', ascii);
+            }});
+        }}
+
+        function downloadHexBinary() {{
+            if (!activeHexItem || !activeHexItem.raw_payload_hex) return;
+            const hex = activeHexItem.raw_payload_hex;
+            const bytes = new Uint8Array(hex.length / 2);
+            for (let i = 0; i < bytes.length; i++) {{
+                bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+            }}
+            const blob = new Blob([bytes], {{ type: 'application/octet-stream' }});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            const page = activeHexItem.page_id || 0;
+            const off = activeHexItem.offset_in_page || 0;
+            a.href = url;
+            a.download = `payload_p${{page}}_off0x${{off.toString(16)}}.bin`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }}
+
+        document.addEventListener('keydown', (e) => {{
+            if (e.key === 'Escape') closeHexModal();
+        }});
+
+        // ==========================================
+        // DATABASE SCHEMA & TOPOLOGY RENDERER
+        // ==========================================
+        function renderSchemaDiagram() {{
+            if (!schemaData || !schemaData.tables) return;
+            const tables = schemaData.tables;
+            const relations = schemaData.relations || [];
+
+            const totalCols = tables.reduce((acc, t) => acc + (t.columns ? t.columns.length : 0), 0);
+            const summaryBox = document.getElementById('schemaSummaryCards');
+            if (summaryBox) {{
+                summaryBox.innerHTML = `
+                    <div class="stat-card">
+                        <div class="label">Tables</div>
+                        <div class="value" style="color: var(--accent);">${{tables.length}}</div>
+                        <div class="sub">Structured Schemas</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="label">Total Columns</div>
+                        <div class="value" style="color: #38bdf8;">${{totalCols}}</div>
+                        <div class="sub">Across All Tables</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="label">Relationships</div>
+                        <div class="value" style="color: #a855f7;">${{relations.length}}</div>
+                        <div class="sub">Foreign Key Links</div>
+                    </div>
+                `;
+            }}
+
+            const grid = document.getElementById('schemaTablesGrid');
+            if (grid) {{
+                let cardsHtml = '';
+                for (const t of tables) {{
+                    let colsHtml = '';
+                    if (t.columns) {{
+                        for (const col of t.columns) {{
+                            let badges = '';
+                            if (col.is_pk) badges += ' <span class="badge-pk">PK</span>';
+                            const isFk = relations.some(r => r.source_table.toLowerCase() === t.name.toLowerCase() && r.source_column.toLowerCase() === col.name.toLowerCase());
+                            if (isFk) badges += ' <span class="badge-fk">FK</span>';
+
+                            colsHtml += `
+                                <li class="schema-col-row">
+                                    <span class="schema-col-name">${{escapeHtml(col.name)}}${{badges}}</span>
+                                    <span class="schema-affinity">${{escapeHtml(col.affinity || 'ANY')}}</span>
+                                </li>
+                            `;
+                        }}
+                    }}
+
+                    cardsHtml += `
+                        <div class="schema-card">
+                            <div class="schema-card-header">
+                                <span class="schema-table-title">🗄️ ${{escapeHtml(t.name)}}</span>
+                                <span style="font-family: monospace; font-size: 0.75rem; color: #64748b;">Root Page: ${{t.root_page || '-'}}</span>
+                            </div>
+                            <ul class="schema-cols-list">
+                                ${{colsHtml}}
+                            </ul>
+                            <div class="schema-card-footer">
+                                <span>${{t.columns ? t.columns.length : 0}} columns</span>
+                                <span>${{t.is_without_rowid ? 'WITHOUT ROWID' : 'RowID Table'}}</span>
+                            </div>
+                        </div>
+                    `;
+                }}
+                grid.innerHTML = cardsHtml;
+            }}
+
+            const mText = document.getElementById('mermaidCodeText');
+            if (mText) {{
+                mText.textContent = schemaData.mermaid || 'erDiagram\\n    %% No tables found';
+            }}
+        }}
+
+        function copyMermaidCode() {{
+            if (!schemaData || !schemaData.mermaid) return;
+            navigator.clipboard.writeText(schemaData.mermaid).then(() => {{
+                const btn = document.getElementById('btnCopyMermaid');
+                if (btn) {{
+                    const orig = btn.innerHTML;
+                    btn.innerHTML = '✅ Copied!';
+                    setTimeout(() => {{ btn.innerHTML = orig; }}, 2000);
+                }}
+            }}).catch(() => {{
+                prompt('Mermaid Code:', schemaData.mermaid);
+            }});
+        }}
+
         // Initial render
+        applyLanguage();
         applyFilters();
+        renderAntiForensicsBanner();
     </script>
 </body>
 </html>

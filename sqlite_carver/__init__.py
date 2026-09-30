@@ -7,11 +7,26 @@ carve, and analyze deleted records, freelists, unallocated spaces, and WAL
 transaction diffs from SQLite databases.
 """
 
-from sqlite_carver.core.carver import CarvedRecord, SQLiteCarver, TableSchema
-from sqlite_carver.core.parser import Cell, DatabaseHeader, DatabaseParser, PageHeader, PageType
+__version__ = "1.9.0"
+
+from sqlite_carver.core.carver import CarvedRecord, IndexSchema, SQLiteCarver, TableSchema
+from sqlite_carver.core.correlator import EntityCorrelator, FKLink, FKResolution
+from sqlite_carver.core.integrity import compute_record_evidence_hash, hash_bytes, hash_file
+from sqlite_carver.core.parser import Cell, DatabaseHeader, DatabaseParser, PageHeader, PageType, StorageBreakdown
 from sqlite_carver.core.search import ForensicSearchEngine, SearchMatch, recursive_search_in_data
+from sqlite_carver.core.shm import ShmAnalyzer, ShmHeader
 from sqlite_carver.core.varint import decode_serial_value, encode_varint, read_varint, safe_read_varint
-from sqlite_carver.core.wal_diff import ColumnDiff, MutationType, RowMutation, WalDiffEngine, WalFrame, WalHeader
+from sqlite_carver.core.wal_diff import (
+    ColumnDiff,
+    JournalDiffEngine,
+    JournalFrame,
+    JournalHeader,
+    MutationType,
+    RowMutation,
+    WalDiffEngine,
+    WalFrame,
+    WalHeader,
+)
 from sqlite_carver.decoders.blobs import (
     DecodedBlobPayload,
     decode_bplist,
@@ -21,19 +36,61 @@ from sqlite_carver.decoders.blobs import (
     dump_blob_to_file,
     inspect_blob,
 )
+from sqlite_carver.decoders.geolocation import DecodedCoordinate, extract_coordinates
 from sqlite_carver.decoders.timestamps import DecodedTimestamp, decode_timestamp, get_all_possible_timestamps
-from sqlite_carver.exporters.export import export_csv, export_html, export_json, export_jsonl, export_parquet
+from sqlite_carver.core.encryption import (
+    EncryptionAnalysis,
+    analyze_database_encryption,
+    calculate_shannon_entropy,
+    decrypt_sqlcipher_database,
+    decrypt_sqlcipher_page,
+    try_decrypt_database,
+)
+from sqlite_carver.core.mutations import MutationDelta, detect_record_mutations
+from sqlite_carver.exporters.export import (
+    dispatch_export,
+    export_csv,
+    export_html,
+    export_json,
+    export_jsonl,
+    export_parquet,
+    export_sqlite,
+)
 from sqlite_carver.exporters.html_report import generate_html_report
 
-__version__ = "1.3.0"
+try:
+    from sqlite_carver.gui.app import HexInspectorModal, SQLiteCarverApp, launch_gui
+except ImportError:
+    pass
+
 __all__ = [
     "SQLiteCarver",
     "CarvedRecord",
     "TableSchema",
+    "IndexSchema",
+    "EntityCorrelator",
+    "EncryptionAnalysis",
+    "analyze_database_encryption",
+    "calculate_shannon_entropy",
+    "MutationDelta",
+    "detect_record_mutations",
+    "FKLink",
+    "FKResolution",
+    "ShmAnalyzer",
+    "ShmHeader",
+    "DecodedCoordinate",
+    "extract_coordinates",
+    "hash_file",
+    "hash_bytes",
+    "compute_record_evidence_hash",
     "DatabaseParser",
     "DatabaseHeader",
     "PageHeader",
     "PageType",
+    "StorageBreakdown",
+    "JournalDiffEngine",
+    "JournalHeader",
+    "JournalFrame",
     "Cell",
     "read_varint",
     "safe_read_varint",
@@ -64,4 +121,12 @@ __all__ = [
     "generate_html_report",
     "export_csv",
     "export_parquet",
+    "export_sqlite",
+    "dispatch_export",
+    "try_decrypt_database",
+    "decrypt_sqlcipher_database",
+    "decrypt_sqlcipher_page",
+    "launch_gui",
+    "SQLiteCarverApp",
+    "HexInspectorModal",
 ]

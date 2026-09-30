@@ -1,9 +1,11 @@
 from sqlite_carver.exporters.export import (
+    dispatch_export,
     export_csv,
     export_html,
     export_json,
     export_jsonl,
     export_parquet,
+    export_sqlite,
     mutation_to_dict,
     record_to_dict,
     serialize_value,
@@ -20,4 +22,6 @@ __all__ = [
     "generate_html_report",
     "export_csv",
     "export_parquet",
+    "export_sqlite",
+    "dispatch_export",
 ]

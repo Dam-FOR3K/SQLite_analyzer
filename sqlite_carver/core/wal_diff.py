@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlite_carver.core.carver import CarvedRecord, SQLiteCarver, TableSchema
+from sqlite_carver.core.encryption import decrypt_wal_frame_page
 from sqlite_carver.core.parser import DatabaseParser, PageHeader, PageType
 
 
@@ -43,6 +44,7 @@ class RowMutation:
     is_commit: bool = False
     is_wal_only_table: bool = False
     diff_state: str = "diff_from_db"  # 'wal_only', 'diff_from_db', 'same_as_db', 'wal_only_table'
+    journal_source: str = "wal"  # 'wal' or 'rollback_journal'
     details: str = ""
 
 
@@ -99,6 +101,7 @@ class WalFrame:
     checksum2: int
     page_data: bytes
     is_commit: bool = False
+    is_wal_slack: bool = False
 
     @classmethod
     def from_bytes(
@@ -151,9 +154,151 @@ class JournalHeader:
         )
 
 
+@dataclass
+class JournalFrame:
+    index: int
+    page_id: int
+    page_data: bytes
+    checksum: int
+
+
+class JournalDiffEngine:
+    """
+    Parses SQLite Rollback Journal (.db-journal / -journal) files
+    and reconstructs pre-transaction timeline mutations against the base database.
+    """
+
+    def __init__(
+        self,
+        base_db_data: bytes | memoryview,
+        journal_data: bytes | memoryview,
+        user_schemas: Optional[List[TableSchema]] = None,
+    ):
+        self.base_carver = SQLiteCarver(base_db_data, user_schemas=user_schemas)
+        self.journal_data = bytes(journal_data)
+        self.journal_header = JournalHeader.from_bytes(self.journal_data)
+        self.page_size = self.journal_header.page_size if self.journal_header else self.base_carver.page_size
+        self.frames: List[JournalFrame] = []
+        if self.journal_header:
+            self._parse_frames()
+
+    def _parse_frames(self) -> None:
+        if not self.journal_header or len(self.journal_data) < 28:
+            return
+
+        sector_size = self.journal_header.sector_size if self.journal_header.sector_size >= 512 else 512
+        offset = sector_size
+        entry_size = 4 + self.page_size + 4
+        frame_idx = 1
+        expected = self.journal_header.page_count
+
+        while offset + entry_size <= len(self.journal_data):
+            if expected != 0xFFFFFFFF and expected > 0 and (frame_idx - 1) >= expected:
+                break
+            page_id, = struct.unpack(">I", self.journal_data[offset : offset + 4])
+            if page_id == 0 or page_id > 10_000_000:
+                offset += 512
+                continue
+
+            pdata = self.journal_data[offset + 4 : offset + 4 + self.page_size]
+            cksum, = struct.unpack(">I", self.journal_data[offset + 4 + self.page_size : offset + entry_size])
+            self.frames.append(JournalFrame(index=frame_idx, page_id=page_id, page_data=pdata, checksum=cksum))
+            offset += entry_size
+            frame_idx += 1
+
+    def compute_timeline_diff(self) -> List[RowMutation]:
+        mutations: List[RowMutation] = []
+        if not self.journal_header:
+            return mutations
+
+        for frame in self.frames:
+            journal_records = self.base_carver.carve_page_data(
+                frame.page_data,
+                page_id=frame.page_id,
+                is_page_1=(frame.page_id == 1),
+                include_active=True,
+            )
+            journal_active = [r for r in journal_records if r.source == "active"]
+
+            db_records = self.base_carver.carve_page(frame.page_id, include_active=True)
+            db_active = [r for r in db_records if r.source == "active"]
+
+            db_map = {}
+            for r in db_active:
+                if r.matched_table and r.rowid is not None:
+                    db_map[(r.matched_table, r.rowid)] = r
+
+            journal_map = {}
+            for r in journal_active:
+                if r.matched_table and r.rowid is not None:
+                    journal_map[(r.matched_table, r.rowid)] = r
+
+            # Compare pre-transaction records
+            for key, old_r in journal_map.items():
+                if key in db_map:
+                    new_r = db_map[key]
+                    if old_r.values != new_r.values:
+                        diffs = []
+                        max_len = max(len(old_r.values), len(new_r.values))
+                        for i in range(max_len):
+                            ov = old_r.values[i] if i < len(old_r.values) else None
+                            nv = new_r.values[i] if i < len(new_r.values) else None
+                            if ov != nv:
+                                cname = old_r.column_names[i] if i < len(old_r.column_names) else f"c{i}"
+                                diffs.append(ColumnDiff(column_name=cname, old_value=ov, new_value=nv))
+                        mutations.append(
+                            RowMutation(
+                                mutation_type=MutationType.UPDATE,
+                                frame_index=frame.index,
+                                page_id=frame.page_id,
+                                table_name=old_r.matched_table,
+                                rowid=old_r.rowid,
+                                old_values=old_r.values,
+                                new_values=new_r.values,
+                                column_diffs=diffs,
+                                journal_source="rollback_journal",
+                                details=f"Row updated from pre-transaction state in rollback journal frame #{frame.index}",
+                            )
+                        )
+                else:
+                    mutations.append(
+                        RowMutation(
+                            mutation_type=MutationType.DELETE,
+                            frame_index=frame.index,
+                            page_id=frame.page_id,
+                            table_name=old_r.matched_table,
+                            rowid=old_r.rowid,
+                            old_values=old_r.values,
+                            new_values=None,
+                            journal_source="rollback_journal",
+                            details=f"Pre-transaction record preserved in rollback journal frame #{frame.index} (deleted in base DB)",
+                        )
+                    )
+
+            # Check new rows inserted after rollback journal was written
+            for key, new_r in db_map.items():
+                if key not in journal_map:
+                    mutations.append(
+                        RowMutation(
+                            mutation_type=MutationType.INSERT,
+                            frame_index=frame.index,
+                            page_id=frame.page_id,
+                            table_name=new_r.matched_table,
+                            rowid=new_r.rowid,
+                            old_values=None,
+                            new_values=new_r.values,
+                            journal_source="rollback_journal",
+                            details=f"New row inserted after pre-transaction rollback journal frame #{frame.index}",
+                        )
+                    )
+
+        return mutations
+
+
 class WalDiffEngine:
     """
     Parses WAL frames and reconstructs row-level transaction timelines.
+    Supports WAL Slack recovery and multi-version page history (Cellebrite Slide 41-42).
     """
 
     def __init__(
@@ -161,6 +306,8 @@ class WalDiffEngine:
         base_db_data: bytes | memoryview,
         wal_data: bytes | memoryview,
         user_schemas: Optional[List[TableSchema]] = None,
+        include_stale_frames: bool = False,
+        encryption_meta: Optional[Dict[str, Any]] = None,
     ):
         self.base_carver = SQLiteCarver(base_db_data, user_schemas=user_schemas)
         self.wal_data = memoryview(wal_data)
@@ -170,7 +317,12 @@ class WalDiffEngine:
             if self.wal_header
             else self.base_carver.parser.page_size
         )
-        self.frames: List[WalFrame] = []
+        self.include_stale_frames = include_stale_frames
+        self.encryption_meta = encryption_meta
+        self.frames: List[WalFrame] = []            # Active transaction sequence frames
+        self.slack_frames: List[WalFrame] = []      # WAL slack / superseded frames (older salts)
+        self.all_frames: List[WalFrame] = []        # All parsed frames
+        self.page_versions: Dict[int, List[WalFrame]] = {}  # Page ID -> List of frame versions
         self._parse_frames()
 
     def _parse_frames(self) -> None:
@@ -181,19 +333,85 @@ class WalDiffEngine:
         offset = 32  # Skip 32-byte WAL header
         frame_size = 24 + self.page_size
         frame_idx = 1
+        active_salt_broken = False
 
         while offset + frame_size <= len(self.wal_data):
             chunk = self.wal_data[offset : offset + frame_size]
             frame = WalFrame.from_bytes(frame_idx, chunk, self.page_size)
             if frame:
-                # Stop if salt doesn't match current active transaction sequence (stale checkpointed frames)
+                # If encryption key is available, decrypt the frame payload in memory
+                if self.encryption_meta and self.encryption_meta.get("raw_key"):
+                    raw_key = self.encryption_meta["raw_key"]
+                    scheme = self.encryption_meta.get("scheme", "SQLCipher")
+                    reserve = self.encryption_meta.get(
+                        "reserve_bytes", 48 if "sqlcipher" in scheme.lower() else 0
+                    )
+                    frame.page_data = decrypt_wal_frame_page(
+                        frame.page_data,
+                        page_id=frame.page_id,
+                        key=raw_key,
+                        scheme=scheme,
+                        page_size=self.page_size,
+                        reserve=reserve,
+                    )
+
+                # If salt doesn't match active transaction sequence, it belongs to WAL Slack
                 if self.wal_header and frame.salt1 != self.wal_header.salt1:
-                    break
-                # Only keep frames referencing a valid page_id
+                    active_salt_broken = True
+
                 if 1 <= frame.page_id <= 10_000_000:
-                    self.frames.append(frame)
+                    frame.is_wal_slack = active_salt_broken
+                    if not active_salt_broken:
+                        self.frames.append(frame)
+                    else:
+                        self.slack_frames.append(frame)
+
+                    self.all_frames.append(frame)
+                    if frame.page_id not in self.page_versions:
+                        self.page_versions[frame.page_id] = []
+                    self.page_versions[frame.page_id].append(frame)
+
             offset += frame_size
             frame_idx += 1
+
+    def get_multi_version_pages(self) -> Dict[int, List[Dict[str, Any]]]:
+        """
+        Identifies all pages that have multiple historical versions preserved in the WAL (Cellebrite Slide 41-42).
+        Returns a mapping of page_id -> list of version summaries across WAL frames.
+        """
+        multi: Dict[int, List[Dict[str, Any]]] = {}
+        for pid, v_frames in self.page_versions.items():
+            if len(v_frames) > 1:
+                summaries = []
+                for v in v_frames:
+                    summaries.append({
+                        "frame_index": v.frame_index,
+                        "is_commit": v.is_commit,
+                        "is_wal_slack": v.is_wal_slack,
+                        "salt1": v.salt1,
+                        "salt2": v.salt2,
+                        "db_size_after_commit": v.db_size_after_commit,
+                    })
+                multi[pid] = summaries
+        return multi
+
+    def carve_wal_slack_records(self) -> List[CarvedRecord]:
+        """
+        Forensic Carver for WAL Slack Space (Cellebrite Slide 41-42).
+        Extracts records from superseded WAL frames with stale salts past checkpoint boundaries.
+        """
+        slack_records: List[CarvedRecord] = []
+        for frame in self.slack_frames:
+            records = self.base_carver.carve_page_data(
+                frame.page_data,
+                page_id=frame.page_id,
+                is_page_1=(frame.page_id == 1),
+                include_active=True,
+            )
+            for r in records:
+                r.source = "wal_slack"
+                slack_records.append(r)
+        return slack_records
 
     def compute_timeline_diff(self) -> List[RowMutation]:
         """

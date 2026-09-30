@@ -128,11 +128,18 @@ class ForensicSearchEngine:
         db_data: bytes | memoryview,
         wal_data: Optional[bytes | memoryview] = None,
         user_schemas: Optional[List[TableSchema]] = None,
+        encryption_meta: Optional[Dict[str, Any]] = None,
     ):
         self.carver = SQLiteCarver(db_data, user_schemas=user_schemas)
         self.wal_data = wal_data
+        self.encryption_meta = encryption_meta
         self.wal_engine = (
-            WalDiffEngine(db_data, wal_data, user_schemas=user_schemas)
+            WalDiffEngine(
+                db_data,
+                wal_data,
+                user_schemas=user_schemas,
+                encryption_meta=encryption_meta,
+            )
             if wal_data and len(wal_data) >= 32
             else None
         )
@@ -183,6 +190,25 @@ class ForensicSearchEngine:
                         )
                     )
 
+            # If not matched in decoded values, also check raw_payload
+            if not any(m.record is rec for m in matches) and rec.raw_payload:
+                found, fmt, snippet = recursive_search_in_data(rec.raw_payload, query, is_hex=is_hex, current_path="raw_payload")
+                if found:
+                    matches.append(
+                        SearchMatch(
+                            record_source=rec.source,
+                            page_id=rec.page_id,
+                            offset_in_page=rec.offset_in_page,
+                            confidence=rec.confidence,
+                            table_name=rec.matched_table,
+                            rowid=rec.rowid,
+                            matched_column="raw_payload",
+                            matched_value_snippet=snippet,
+                            container_format=fmt,
+                            record=rec,
+                        )
+                    )
+
         # 2. Search WAL mutations if available
         if include_wal and self.wal_engine and not deleted_only:
             try:
@@ -211,6 +237,80 @@ class ForensicSearchEngine:
                                     record=mut,
                                 )
                             )
+            except Exception:
+                pass
+
+        # 3. Deep Raw Page Fallback Scan (Slack, Margins, Uncarved Reserved Bytes)
+        if not table_filter and not deleted_only:
+            try:
+                if is_hex:
+                    clean_h = query.lower().replace(" ", "").replace("0x", "")
+                    target_bytes = bytes.fromhex(clean_h) if len(clean_h) % 2 == 0 else b""
+                else:
+                    target_bytes = query.encode("utf-8", errors="ignore")
+
+                if target_bytes and len(target_bytes) >= 2:
+                    psize = self.carver.parser.page_size
+                    res_sz = self.carver.parser.reserved_space
+                    tot_pages = self.carver.parser.total_pages
+
+                    for pid in range(1, tot_pages + 1):
+                        pdata = self.carver.parser.get_page_bytes(pid)
+                        if not pdata:
+                            continue
+                        raw_bytes = bytes(pdata)
+                        raw_lower = raw_bytes.lower() if not is_hex else raw_bytes
+                        target_search = target_bytes.lower() if not is_hex else target_bytes
+
+                        pos = 0
+                        while True:
+                            idx = raw_lower.find(target_search, pos)
+                            if idx == -1:
+                                break
+                            # Check if already covered by an existing match on this page
+                            already_covered = any(
+                                m.page_id == pid and abs(m.offset_in_page - idx) < 16 for m in matches
+                            )
+                            if not already_covered:
+                                src = (
+                                    "page_reserved_space"
+                                    if res_sz > 0 and idx >= (len(raw_bytes) - res_sz)
+                                    else "raw_page_data"
+                                )
+                                end_idx = min(len(raw_bytes), idx + len(target_bytes) + 32)
+                                snip_bytes = raw_bytes[idx:end_idx]
+                                snip_txt = snip_bytes.decode("utf-8", errors="replace").strip()
+                                if not snip_txt or sum(1 for c in snip_txt if c.isprintable()) < 2:
+                                    snip_txt = f"0x{snip_bytes[:20].hex()}..."
+
+                                raw_rec = CarvedRecord(
+                                    page_id=pid,
+                                    offset_in_page=idx,
+                                    source=src,
+                                    confidence=0.85,
+                                    matched_table="[Raw Page Data]",
+                                    rowid=None,
+                                    values=[snip_txt],
+                                    column_names=["raw_snippet"],
+                                    column_types=["TEXT" if not is_hex else "BLOB"],
+                                    raw_payload=snip_bytes,
+                                    details=f"Raw occurrence detected in page {pid} at offset {hex(idx)}",
+                                )
+                                matches.append(
+                                    SearchMatch(
+                                        record_source=src,
+                                        page_id=pid,
+                                        offset_in_page=idx,
+                                        confidence=0.85,
+                                        table_name=raw_rec.matched_table,
+                                        rowid=None,
+                                        matched_column="raw_offset",
+                                        matched_value_snippet=snip_txt,
+                                        container_format="raw_bytes",
+                                        record=raw_rec,
+                                    )
+                                )
+                            pos = idx + max(1, len(target_search))
             except Exception:
                 pass
 

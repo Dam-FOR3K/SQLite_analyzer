@@ -118,3 +118,13 @@ def test_freelist_traversal():
     parser = DatabaseParser(db_bytes)
     freelist = parser.parse_freelist_pages()
     assert freelist == [2, 3, 4]
+
+
+def test_zero_length_serial_types():
+    """Verify serial types 0, 8, and 9 decode properly even at exact payload boundary."""
+    payload = bytes([4, 0, 8, 9])
+    rec = decode_record_payload(payload, allow_partial=False)
+    assert rec is not None
+    assert rec.values == [None, 0, 1]
+    assert rec.is_partial is False
+
