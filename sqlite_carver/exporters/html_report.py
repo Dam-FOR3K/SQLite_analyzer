@@ -1751,7 +1751,7 @@ def generate_html_report(
                 if (src === 'deleted' && isActive) return false;
                 if (src === 'freeblock' && !itemSrc.includes('freeblock')) return false;
                 if (src === 'freelist' && !itemSrc.includes('freelist')) return false;
-                if (src === 'slack' && (!itemSrc.includes('slack') && !itemSrc.includes('unallocated'))) return false;
+                if (src === 'slack' && !itemSrc.includes('slack')) return false;
                 if (src === 'unallocated' && !itemSrc.includes('unallocated')) return false;
                 if (src === 'page_reserved_space' && !itemSrc.includes('reserved_space')) return false;
                 if (src === 'wal' && !itemSrc.includes('wal')) return false;

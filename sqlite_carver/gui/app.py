@@ -425,7 +425,7 @@ class SQLiteCarverApp(ctk.CTk):
 
         self.source_filter = ctk.CTkComboBox(
             search_box,
-            values=["All Sources", "Active", "Freeblocks", "Slack", "Resurrected", "WAL / Journal"],
+            values=["All Sources", "Active", "Freeblocks", "Slack", "Unallocated", "Resurrected", "WAL / Journal"],
             width=150,
             command=lambda v: self._apply_filters(),
         )
@@ -710,7 +710,8 @@ class SQLiteCarverApp(ctk.CTk):
         # Update stats
         active_count = sum(1 for r in all_items if getattr(r, "source", "") == "active")
         fb_count = sum(1 for r in all_items if "freeblock" in getattr(r, "source", ""))
-        slack_count = sum(1 for r in all_items if any(s in getattr(r, "source", "") for s in ("slack", "unallocated")))
+        slack_count = sum(1 for r in all_items if "slack" in getattr(r, "source", ""))
+        unalloc_count = sum(1 for r in all_items if "unalloc" in getattr(r, "source", ""))
         resurrect_count = sum(1 for r in all_items if "resurrected" in getattr(r, "source", ""))
         wal_count = sum(1 for r in all_items if isinstance(r, RowMutation) or getattr(r, "is_mutation", False))
 
@@ -718,6 +719,7 @@ class SQLiteCarverApp(ctk.CTk):
         self.card_active["val"].configure(text=f"{active_count:,}")
         self.card_fb["val"].configure(text=f"{fb_count:,}")
         self.card_slack["val"].configure(text=f"{slack_count:,}")
+        self.card_slack["sub"].configure(text=f"Cell Slack ({slack_count}) | Unalloc ({unalloc_count})")
         self.card_resurrect["val"].configure(text=f"{resurrect_count:,}")
         self.card_wal["val"].configure(text=f"{wal_count:,}")
 
@@ -753,7 +755,9 @@ class SQLiteCarverApp(ctk.CTk):
                 continue
             if sel_src == "Freeblocks" and "freeblock" not in src:
                 continue
-            if sel_src == "Slack" and not any(s in src for s in ("slack", "unallocated")):
+            if sel_src == "Slack" and "slack" not in src:
+                continue
+            if sel_src == "Unallocated" and "unalloc" not in src:
                 continue
             if sel_src == "Resurrected" and "resurrected" not in src:
                 continue

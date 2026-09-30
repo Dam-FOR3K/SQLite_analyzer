@@ -300,8 +300,17 @@ def cmd_carve(args: argparse.Namespace) -> None:
         if args.table and (not r.matched_table or args.table.lower() != r.matched_table.lower()):
             continue
         source_filter = getattr(args, "source", None)
-        if source_filter and r.source.lower() != source_filter.lower():
-            continue
+        if source_filter:
+            sf = source_filter.lower()
+            r_src = r.source.lower()
+            if sf == "slack":
+                if "slack" not in r_src:
+                    continue
+            elif sf in ("unallocated", "unalloc"):
+                if "unalloc" not in r_src:
+                    continue
+            elif sf not in r_src and r_src != sf:
+                continue
         if r.confidence < args.min_confidence:
             continue
         filtered.append(r)
