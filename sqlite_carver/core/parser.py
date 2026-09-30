@@ -159,7 +159,7 @@ class DatabaseHeader:
     @property
     def vacuum_mode(self) -> str:
         """
-        Forensic vacuum mode determined by header offsets 52 and 64 (Cellebrite Slide 7):
+        Forensic vacuum mode determined by header offsets 52 and 64:
         - NONE: Auto-vacuum disabled. No pointermap pages exist.
         - FULL: Full auto-vacuum enabled. Pointermap pages maintained and DB shrinks automatically.
         - INCREMENTAL: Incremental vacuum enabled. Pointermap pages maintained, truncated via PRAGMA incremental_vacuum.

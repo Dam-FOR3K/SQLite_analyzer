@@ -178,7 +178,7 @@ def check_anti_forensics_anomalies(
             "total_reserved_bytes": total_res,
         })
 
-    # 5. Auto-Vacuum & Pointermap status (Cellebrite Slide 7)
+    # 5. Auto-Vacuum & Pointermap status
     if getattr(hdr, "has_pointermap", False):
         if hdr.vacuum_mode == "FULL":
             anomalies.append({
@@ -207,7 +207,7 @@ def check_anti_forensics_anomalies(
                 "largest_root_btree_page": hdr.largest_root_btree_page,
             })
 
-    # 6. Anti-Forensic PRAGMA secure_delete Detection (Cellebrite Slide 9)
+    # 6. Anti-Forensic PRAGMA secure_delete Detection
     # When secure_delete is active, SQLite overwrites deleted cell payload in freeblocks with 0x00.
     try:
         total_fb_bytes = 0

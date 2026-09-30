@@ -298,7 +298,7 @@ class JournalDiffEngine:
 class WalDiffEngine:
     """
     Parses WAL frames and reconstructs row-level transaction timelines.
-    Supports WAL Slack recovery and multi-version page history (Cellebrite Slide 41-42).
+    Supports WAL Slack recovery and multi-version page history.
     """
 
     def __init__(
@@ -376,7 +376,7 @@ class WalDiffEngine:
 
     def get_multi_version_pages(self) -> Dict[int, List[Dict[str, Any]]]:
         """
-        Identifies all pages that have multiple historical versions preserved in the WAL (Cellebrite Slide 41-42).
+        Identifies all pages that have multiple historical versions preserved in the WAL.
         Returns a mapping of page_id -> list of version summaries across WAL frames.
         """
         multi: Dict[int, List[Dict[str, Any]]] = {}
@@ -397,7 +397,7 @@ class WalDiffEngine:
 
     def carve_wal_slack_records(self) -> List[CarvedRecord]:
         """
-        Forensic Carver for WAL Slack Space (Cellebrite Slide 41-42).
+        Forensic Carver for WAL Slack Space.
         Extracts records from superseded WAL frames with stale salts past checkpoint boundaries.
         """
         slack_records: List[CarvedRecord] = []
