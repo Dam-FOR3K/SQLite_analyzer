@@ -321,18 +321,21 @@ def cmd_carve(args: argparse.Namespace) -> None:
 
     # Check companion WAL journal
     wal_mutations: List[RowMutation] = []
-    wal_path = Path(str(db_path) + "-wal")
-    if not wal_path.exists() and db_path.suffix == ".db":
-        alt_wal = db_path.with_suffix(".wal")
-        if alt_wal.exists():
-            wal_path = alt_wal
+    wal_path = None
+    for cand in [
+        Path(str(db_path) + "-wal"),
+        db_path.with_suffix(".wal"),
+        db_path.with_name(db_path.name + ".wal"),
+        db_path.with_name(db_path.stem + "-wal"),
+        db_path.with_name(db_path.stem + ".wal"),
+    ]:
+        if cand.exists() and cand.is_file():
+            wal_path = cand
+            break
 
-    if wal_path.exists():
+    if wal_path and wal_path.exists():
         wal_bytes = wal_path.read_bytes()
-        if len(wal_bytes) == 0 or wal_bytes[:4] == b"\x00\x00\x00\x00":
-            # Normal checkpointed / reset WAL (no active pending transactions)
-            pass
-        elif len(wal_bytes) < 32:
+        if len(wal_bytes) < 32:
             console.print(f"[dim]{t('wal_empty_or_reset', name=wal_path.name)}[/dim]")
         else:
             try:
@@ -342,7 +345,7 @@ def cmd_carve(args: argparse.Namespace) -> None:
                     user_schemas=list(carver.schemas.values()),
                     encryption_meta=enc_meta,
                 )
-                if not wal_engine.wal_header:
+                if not wal_engine.wal_header and len(wal_engine.all_frames) == 0:
                     magic_val = struct.unpack(">I", wal_bytes[:4])[0] if len(wal_bytes) >= 4 else 0
                     console.print(f"[yellow]{t('wal_invalid_magic', name=wal_path.name, size=len(wal_bytes), magic=magic_val)}[/yellow]")
                 else:
@@ -556,7 +559,7 @@ def cmd_wal_diff(args: argparse.Namespace) -> None:
 
     engine = WalDiffEngine(db_data, wal_data, encryption_meta=enc_meta)
 
-    if not engine.wal_header:
+    if not engine.wal_header and len(engine.all_frames) == 0:
         if len(wal_data) < 32 or wal_data[:4] == b"\x00\x00\x00\x00":
             console.print(f"[yellow]{t('wal_empty_or_reset', name=wal_path.name)}[/yellow]")
             return
@@ -564,10 +567,13 @@ def cmd_wal_diff(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     wh = engine.wal_header
+    ver = wh.format_version if wh else 3007000
+    psize = engine.page_size
+    seq = wh.checkpoint_seq if wh else 0
     multi_pages = engine.get_multi_version_pages()
     slack_info = f", WAL Slack Frames: {len(engine.slack_frames)}" if engine.slack_frames else ""
     multi_info = f", Multi-version Pages: {len(multi_pages)}" if multi_pages else ""
-    console.print(f"[bold cyan]{t('wal_header_info', version=wh.format_version, size=wh.page_size, seq=wh.checkpoint_seq, frames=len(engine.frames))}{slack_info}{multi_info}[/bold cyan]")
+    console.print(f"[bold cyan]{t('wal_header_info', version=ver, size=psize, seq=seq, frames=len(engine.frames))}{slack_info}{multi_info}[/bold cyan]")
 
     if getattr(args, "wal_slack", False) or getattr(args, "slack", False):
         slack_recs = engine.carve_wal_slack_records()

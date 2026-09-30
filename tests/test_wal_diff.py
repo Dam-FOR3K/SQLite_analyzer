@@ -110,3 +110,41 @@ def test_wal_high_page_id_no_memory_error():
     # Must compute without MemoryError
     mutations = engine.compute_timeline_diff()
     assert isinstance(mutations, list)
+
+
+def test_wal_mismatched_salt_and_checkpoint_fallback():
+    """Verify that when WAL header salt does not match frame salt (post-checkpoint/reset), frames are not lost."""
+    import struct
+    db_data = b"SQLite format 3\x00" + b"\x00" * 4080
+    raw_wal = bytearray(32 + 24 + 4096)
+    # Header has salt1 = 0xAAAA (e.g. incremented by checkpoint)
+    struct.pack_into(">8I", raw_wal, 0, 0x377F0682, 3007000, 4096, 2, 0xAAAA, 0x1111, 0, 0)
+    # Frame has older salt1 = 0xBBBB from prior transaction
+    struct.pack_into(">6I", raw_wal, 32, 2, 1, 0xBBBB, 0x2222, 0, 0)
+    # Leaf table page
+    struct.pack_into(">BHHHB", raw_wal, 32 + 24, 0x0D, 0, 0, 4096, 0)
+
+    engine = WalDiffEngine(db_data, bytes(raw_wal))
+    # Should fallback to parsing frames
+    assert len(engine.frames) == 1
+    assert len(engine.all_frames) == 1
+    mutations = engine.compute_timeline_diff()
+    assert isinstance(mutations, list)
+
+
+def test_wal_zeroed_header_with_valid_frames():
+    """Verify that when SQLite zeroes out the WAL header on checkpoint/close, valid trailing frames are still parsed."""
+    import struct
+    db_data = b"SQLite format 3\x00" + b"\x00" * 4080
+    raw_wal = bytearray(32 + 24 + 4096)
+    # Header is 100% zeroed out (magic=0)
+    # Frame at offset 32 has valid page_id=2
+    struct.pack_into(">6I", raw_wal, 32, 2, 1, 0x5555, 0x6666, 0, 0)
+    struct.pack_into(">BHHHB", raw_wal, 32 + 24, 0x0D, 0, 0, 4096, 0)
+
+    engine = WalDiffEngine(db_data, bytes(raw_wal))
+    assert engine.wal_header is None
+    # Valid frame should still be recovered from offset 32
+    assert len(engine.frames) == 1
+    assert len(engine.all_frames) == 1
+

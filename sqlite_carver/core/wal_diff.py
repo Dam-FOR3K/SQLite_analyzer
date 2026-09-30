@@ -327,13 +327,14 @@ class WalDiffEngine:
 
     def _parse_frames(self) -> None:
         """Iterates over all 24-byte headers + page payloads in WAL file."""
-        if not self.wal_header or len(self.wal_data) < 32:
+        if len(self.wal_data) < 32:
             return
 
         offset = 32  # Skip 32-byte WAL header
         frame_size = 24 + self.page_size
         frame_idx = 1
         active_salt_broken = False
+        active_salt = self.wal_header.salt1 if (self.wal_header and self.wal_header.salt1 != 0) else None
 
         while offset + frame_size <= len(self.wal_data):
             chunk = self.wal_data[offset : offset + frame_size]
@@ -356,7 +357,7 @@ class WalDiffEngine:
                     )
 
                 # If salt doesn't match active transaction sequence, it belongs to WAL Slack
-                if self.wal_header and frame.salt1 != self.wal_header.salt1:
+                if active_salt is not None and frame.salt1 != active_salt:
                     active_salt_broken = True
 
                 if 1 <= frame.page_id <= 10_000_000:
@@ -373,6 +374,11 @@ class WalDiffEngine:
 
             offset += frame_size
             frame_idx += 1
+
+        # Forensic fallback: if no frames matched active salt (e.g. stale header after checkpoint or reset),
+        # treat all valid frames as the active sequence so timeline diffing and row analysis never drop data.
+        if not self.frames and self.all_frames:
+            self.frames = list(self.all_frames)
 
     def get_multi_version_pages(self) -> Dict[int, List[Dict[str, Any]]]:
         """
@@ -428,8 +434,10 @@ class WalDiffEngine:
                 key = (rec.matched_table, rec.rowid)
                 row_state[key] = rec
 
+        target_frames = self.all_frames if (self.include_stale_frames or not self.frames) else self.frames
+
         # Iterate through WAL frames sequentially
-        for frame in self.frames:
+        for frame in target_frames:
             # Carve the single frame page data directly without any dummy memory allocation
             frame_records = self.base_carver.carve_page_data(
                 frame.page_data,

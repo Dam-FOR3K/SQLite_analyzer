@@ -629,8 +629,35 @@ class SQLiteCarverApp(ctk.CTk):
     def _carve_worker(self) -> None:
         start_time = time.time()
         try:
-            raw_bytes = self.db_path.read_bytes()
+            target_path = self.db_path
+            raw_bytes = target_path.read_bytes()
             password = self.key_entry.get().strip() or None
+
+            # Detect if user opened a WAL file directly
+            is_direct_wal = target_path.name.lower().endswith(("-wal", ".wal"))
+            companion_db = None
+            if is_direct_wal:
+                candidates = []
+                if target_path.name.endswith("-wal"):
+                    candidates.append(target_path.with_name(target_path.name[:-4]))
+                if target_path.suffix == ".wal":
+                    candidates.append(target_path.with_suffix(".db"))
+                    candidates.append(target_path.with_suffix(".sqlite"))
+                    candidates.append(target_path.with_suffix(""))
+                for cand in candidates:
+                    if cand and cand.exists() and cand.is_file():
+                        companion_db = cand
+                        break
+
+            wal_bytes = None
+            if is_direct_wal:
+                if companion_db:
+                    wal_bytes = raw_bytes
+                    raw_bytes = companion_db.read_bytes()
+                else:
+                    wal_bytes = raw_bytes
+                    # Standalone WAL without companion DB
+                    raw_bytes = b"SQLite format 3\x00" + b"\x00" * 4080
 
             # Check encryption
             dec_meta = None
@@ -662,29 +689,35 @@ class SQLiteCarverApp(ctk.CTk):
 
             # Companion WAL
             wal_mutations = []
+            wal_records = []
             if self.chk_wal.get():
-                wal_path = Path(str(self.db_path) + "-wal")
-                if not wal_path.exists() and self.db_path.suffix == ".db":
-                    alt_wal = self.db_path.with_suffix(".wal")
-                    if alt_wal.exists():
-                        wal_path = alt_wal
+                if not wal_bytes:
+                    for cand in [
+                        Path(str(target_path) + "-wal"),
+                        target_path.with_suffix(".wal"),
+                        target_path.with_name(target_path.name + ".wal"),
+                        target_path.with_name(target_path.stem + "-wal"),
+                        target_path.with_name(target_path.stem + ".wal"),
+                    ]:
+                        if cand.exists() and cand.is_file():
+                            wal_bytes = cand.read_bytes()
+                            break
 
-                if wal_path.exists():
-                    wal_bytes = wal_path.read_bytes()
-                    if len(wal_bytes) >= 32 and wal_bytes[:4] != b"\x00\x00\x00\x00":
-                        try:
-                            wal_engine = WalDiffEngine(
-                                raw_bytes,
-                                wal_bytes,
-                                user_schemas=list(self.carver.schemas.values()),
-                                encryption_meta=dec_meta,
-                            )
-                            if wal_engine.wal_header:
-                                wal_mutations = wal_engine.compute_timeline_diff()
-                        except Exception:
-                            pass
+                if wal_bytes and len(wal_bytes) >= 32:
+                    try:
+                        wal_engine = WalDiffEngine(
+                            raw_bytes,
+                            wal_bytes,
+                            user_schemas=list(self.carver.schemas.values()),
+                            encryption_meta=dec_meta,
+                        )
+                        wal_mutations = wal_engine.compute_timeline_diff()
+                        if wal_engine.slack_frames:
+                            wal_records = wal_engine.carve_wal_slack_records()
+                    except Exception as ex:
+                        print(f"[WAL Warning] Error in WAL diff engine: {ex}")
 
-            all_items = list(records) + list(wal_mutations)
+            all_items = list(records) + list(wal_records) + list(wal_mutations)
             elapsed = time.time() - start_time
 
             # Update UI on main thread
@@ -713,7 +746,7 @@ class SQLiteCarverApp(ctk.CTk):
         slack_count = sum(1 for r in all_items if "slack" in getattr(r, "source", ""))
         unalloc_count = sum(1 for r in all_items if "unalloc" in getattr(r, "source", ""))
         resurrect_count = sum(1 for r in all_items if "resurrected" in getattr(r, "source", ""))
-        wal_count = sum(1 for r in all_items if isinstance(r, RowMutation) or getattr(r, "is_mutation", False))
+        wal_count = sum(1 for r in all_items if isinstance(r, RowMutation) or getattr(r, "is_mutation", False) or "wal" in getattr(r, "source", ""))
 
         self.card_total["val"].configure(text=f"{len(all_items):,}")
         self.card_active["val"].configure(text=f"{active_count:,}")
@@ -810,8 +843,15 @@ class SQLiteCarverApp(ctk.CTk):
                     pairs.append(f"{cn}: {cv}")
                 cols_preview = " | ".join(pairs)
             elif isinstance(item, RowMutation):
-                diffs = [f"{d.column_name}: {d.old_value} -> {d.new_value}" for d in item.column_diffs]
-                cols_preview = f"[{item.mutation_type.value}] " + " | ".join(diffs)
+                if item.column_diffs:
+                    diffs = [f"{d.column_name}: {d.old_value} -> {d.new_value}" for d in item.column_diffs]
+                    cols_preview = f"[{item.mutation_type.value}] " + " | ".join(diffs)
+                elif item.new_values:
+                    cols_preview = f"[{item.mutation_type.value}] " + ", ".join(str(v) for v in item.new_values)
+                elif item.old_values:
+                    cols_preview = f"[{item.mutation_type.value}] " + ", ".join(str(v) for v in item.old_values)
+                else:
+                    cols_preview = f"[{item.mutation_type.value}] {item.details}"
 
             self.tree.insert(
                 "",
