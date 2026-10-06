@@ -121,6 +121,7 @@ def mutation_to_dict(mut: RowMutation) -> Dict[str, Any]:
         for d in mut.column_diffs
     ]
     return {
+        "is_mutation": True,
         "mutation_type": mut.mutation_type.value,
         "frame_index": mut.frame_index,
         "page_id": mut.page_id,

@@ -628,7 +628,7 @@ class SQLiteCarver:
                 payload_size, p_len = p_res
                 if 2 <= payload_size <= 100 * 1024 * 1024:
                     usable_sz = self.parser.usable_page_size if self.parser and self.parser.usable_page_size > 0 else 4096
-                    local_size = calculate_local_payload_size(payload_size, usable_sz)
+                    local_size = calculate_local_payload_size(payload_size, usable_sz, is_index=is_index_source)
                     has_overflow = payload_size > local_size
 
                     full_payload = None
@@ -1024,7 +1024,7 @@ class SQLiteCarver:
         ptr_array_end = hdr.header_offset + hdr.header_size + (hdr.cell_count * 2)
         cell_start = hdr.cell_content_start
         if ptr_array_end < cell_start and cell_start <= len(page_mem):
-            unalloc_bytes = page_mem[ptr_array_end:cell_start]
+            unalloc_bytes = bytes(page_mem[ptr_array_end:cell_start])
             unalloc_recs = self.scan_bytes_for_records(
                 unalloc_bytes,
                 page_id=page_id,
@@ -1032,17 +1032,36 @@ class SQLiteCarver:
                 source=unalloc_src,
                 known_offsets=known_offsets,
             )
-            if is_index_page and idx_schema:
-                for r in unalloc_recs:
-                    if not r.matched_table:
-                        r.matched_table = idx_schema.table_name
-                        r.column_names = list(idx_schema.indexed_columns) + (
-                            ["rowid"] if len(r.values) > len(idx_schema.indexed_columns) else []
-                        )
-                        r.details = f"Carved from index '{idx_schema.name}' unallocated ({idx_schema.table_name})"
-                    if len(r.values) > len(idx_schema.indexed_columns) and isinstance(r.values[-1], int):
-                        r.rowid = r.values[-1]
-            records.extend(unalloc_recs)
+            if unalloc_recs:
+                if is_index_page and idx_schema:
+                    for r in unalloc_recs:
+                        if not r.matched_table:
+                            r.matched_table = idx_schema.table_name
+                            r.column_names = list(idx_schema.indexed_columns) + (
+                                ["rowid"] if len(r.values) > len(idx_schema.indexed_columns) else []
+                            )
+                            r.details = f"Carved from index '{idx_schema.name}' unallocated ({idx_schema.table_name})"
+                        if len(r.values) > len(idx_schema.indexed_columns) and isinstance(r.values[-1], int):
+                            r.rowid = r.values[-1]
+                records.extend(unalloc_recs)
+            elif any(b != 0 for b in unalloc_bytes):
+                records.append(
+                    CarvedRecord(
+                        page_id=page_id,
+                        offset_in_page=ptr_array_end,
+                        source=unalloc_src,
+                        confidence=0.1,
+                        matched_table="[Raw Unallocated Fragment]",
+                        rowid=None,
+                        values=[f"0x{unalloc_bytes[:64].hex()}..."],
+                        column_names=["raw_hex"],
+                        column_types=["BLOB"],
+                        serial_types=[len(unalloc_bytes) * 2 + 12],
+                        raw_payload=unalloc_bytes,
+                        is_partial=True,
+                        details="Unstructured data (non-zero bytes) found in unallocated space gap.",
+                    )
+                )
 
         # 4. Gaps in cell content area (True Cell Slack)
         slack_src = "index_slack" if is_index_page else "slack"
@@ -1058,7 +1077,7 @@ class SQLiteCarver:
             cur_pos = max(cell_start, hdr.header_offset + hdr.header_size + (hdr.cell_count * 2))
             for s, e in merged_intervals:
                 if s > cur_pos and (s - cur_pos) >= 8:
-                    gap_data = page_mem[cur_pos:s]
+                    gap_data = bytes(page_mem[cur_pos:s])
                     gap_recs = self.scan_bytes_for_records(
                         gap_data,
                         page_id=page_id,
@@ -1066,6 +1085,51 @@ class SQLiteCarver:
                         source=slack_src,
                         known_offsets=known_offsets,
                     )
+                    if gap_recs:
+                        if is_index_page and idx_schema:
+                            for r in gap_recs:
+                                if not r.matched_table:
+                                    r.matched_table = idx_schema.table_name
+                                    r.column_names = list(idx_schema.indexed_columns) + (
+                                        ["rowid"] if len(r.values) > len(idx_schema.indexed_columns) else []
+                                    )
+                                    r.details = f"Carved from index '{idx_schema.name}' slack ({idx_schema.table_name})"
+                                if len(r.values) > len(idx_schema.indexed_columns) and isinstance(r.values[-1], int):
+                                    r.rowid = r.values[-1]
+                        records.extend(gap_recs)
+                    elif any(b != 0 for b in gap_data):
+                        records.append(
+                            CarvedRecord(
+                                page_id=page_id,
+                                offset_in_page=cur_pos,
+                                source=slack_src,
+                                confidence=0.1,
+                                matched_table="[Raw Slack Fragment]",
+                                rowid=None,
+                                values=[f"0x{gap_data[:64].hex()}..."],
+                                column_names=["raw_hex"],
+                                column_types=["BLOB"],
+                                serial_types=[len(gap_data) * 2 + 12],
+                                raw_payload=gap_data,
+                                is_partial=True,
+                                details="Unstructured data (non-zero bytes) found in cell slack gap.",
+                            )
+                        )
+                cur_pos = max(cur_pos, e)
+
+            # Trailing slack between last occupied interval and end of usable page
+            res_sz = self.parser.reserved_space if self.parser else 0
+            usable_end = len(page_mem) - res_sz
+            if usable_end > cur_pos and (usable_end - cur_pos) >= 8:
+                gap_data = bytes(page_mem[cur_pos:usable_end])
+                gap_recs = self.scan_bytes_for_records(
+                    gap_data,
+                    page_id=page_id,
+                    base_offset=cur_pos,
+                    source=slack_src,
+                    known_offsets=known_offsets,
+                )
+                if gap_recs:
                     if is_index_page and idx_schema:
                         for r in gap_recs:
                             if not r.matched_table:
@@ -1077,31 +1141,24 @@ class SQLiteCarver:
                             if len(r.values) > len(idx_schema.indexed_columns) and isinstance(r.values[-1], int):
                                 r.rowid = r.values[-1]
                     records.extend(gap_recs)
-                cur_pos = max(cur_pos, e)
-
-            # Trailing slack between last occupied interval and end of usable page
-            res_sz = self.parser.reserved_space if self.parser else 0
-            usable_end = len(page_mem) - res_sz
-            if usable_end > cur_pos and (usable_end - cur_pos) >= 8:
-                gap_data = page_mem[cur_pos:usable_end]
-                gap_recs = self.scan_bytes_for_records(
-                    gap_data,
-                    page_id=page_id,
-                    base_offset=cur_pos,
-                    source=slack_src,
-                    known_offsets=known_offsets,
-                )
-                if is_index_page and idx_schema:
-                    for r in gap_recs:
-                        if not r.matched_table:
-                            r.matched_table = idx_schema.table_name
-                            r.column_names = list(idx_schema.indexed_columns) + (
-                                ["rowid"] if len(r.values) > len(idx_schema.indexed_columns) else []
-                            )
-                            r.details = f"Carved from index '{idx_schema.name}' slack ({idx_schema.table_name})"
-                        if len(r.values) > len(idx_schema.indexed_columns) and isinstance(r.values[-1], int):
-                            r.rowid = r.values[-1]
-                records.extend(gap_recs)
+                elif any(b != 0 for b in gap_data):
+                    records.append(
+                        CarvedRecord(
+                            page_id=page_id,
+                            offset_in_page=cur_pos,
+                            source=slack_src,
+                            confidence=0.1,
+                            matched_table="[Raw Slack Fragment]",
+                            rowid=None,
+                            values=[f"0x{gap_data[:64].hex()}..."],
+                            column_names=["raw_hex"],
+                            column_types=["BLOB"],
+                            serial_types=[len(gap_data) * 2 + 12],
+                            raw_payload=gap_data,
+                            is_partial=True,
+                            details="Unstructured data (non-zero bytes) found in trailing cell slack gap.",
+                        )
+                    )
 
         # 5. Page Reserved Space (Steganography / Anti-Forensics at page boundary)
         res_sz = self.parser.reserved_space if self.parser else 0

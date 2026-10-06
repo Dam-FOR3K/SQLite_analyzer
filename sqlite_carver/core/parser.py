@@ -47,9 +47,11 @@ class ForensicBuffer:
                 self._file = open(self.path, "rb")
                 self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
                 self._mv = memoryview(self._mmap)
-            except Exception:
+            except Exception as e:
                 if self._file and not self._file.closed:
                     self._file.close()
+                if self.size > 256 * 1024 * 1024:
+                    raise MemoryError(f"Database is too large ({self.size} bytes) to load entirely into memory after mmap failed: {e}")
                 raw = self.path.read_bytes()
                 self._mv = memoryview(raw)
         else:
@@ -311,16 +313,15 @@ class PageHeader:
         )
 
 
-def calculate_local_payload_size(payload_size: int, page_size: int, reserved_space: int = 0) -> int:
+def calculate_local_payload_size(payload_size: int, page_size: int, reserved_space: int = 0, is_index: bool = False) -> int:
     """
     Computes local payload size stored on the page vs overflow pages.
-    SQLite specification formulas:
-    - U = page_size - reserved_space
-    - max_local = U - 35
-    - min_local = ((U - 12) * 32) // 255 - 23
     """
     u = page_size - reserved_space
-    max_local = u - 35
+    if is_index:
+        max_local = ((u - 12) * 64) // 255 - 23
+    else:
+        max_local = u - 35
     min_local = ((u - 12) * 32) // 255 - 23
     if payload_size <= max_local:
         return payload_size
@@ -630,8 +631,28 @@ class DatabaseParser:
                 payload_size, p_len = p_res
                 curr += p_len
 
-                local_payload = bytes(page_data[curr : curr + payload_size])
-                record = decode_record_payload(local_payload, encoding=encoding)
+                local_size = calculate_local_payload_size(
+                    payload_size, self.page_size, self.reserved_space, is_index=True
+                )
+                local_payload = bytes(page_data[curr : curr + local_size])
+                overflow_page = None
+                
+                if local_size < payload_size:
+                    of_offset = curr + local_size
+                    if of_offset + 4 <= len(page_data):
+                        overflow_page = struct.unpack(">I", page_data[of_offset : of_offset + 4])[0]
+                        overflow_data = self.reassemble_overflow_chain(
+                            overflow_page, payload_size - local_size
+                        )
+                        full_payload = local_payload + overflow_data
+                    else:
+                        full_payload = local_payload
+                else:
+                    full_payload = local_payload
+
+                record = decode_record_payload(full_payload, encoding=encoding)
+                cell_total_len = p_len + local_size + (4 if overflow_page else 0) + (4 if left_child else 0)
+                raw_cell = bytes(page_data[cell_offset : cell_offset + cell_total_len])
 
                 return Cell(
                     page_id=page_id,
@@ -639,13 +660,16 @@ class DatabaseParser:
                     page_type=ptype,
                     payload_size=payload_size,
                     left_child_page=left_child,
-                    raw_cell=bytes(page_data[cell_offset : curr + len(local_payload)]),
-                    raw_payload=local_payload,
+                    overflow_page=overflow_page,
+                    raw_cell=raw_cell,
+                    raw_payload=full_payload,
                     record=record,
                     source=source,
                 )
 
-        except Exception:
+        except Exception as e:
+            if isinstance(e, MemoryError):
+                raise
             return None
 
         return None
