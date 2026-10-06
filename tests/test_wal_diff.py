@@ -67,6 +67,8 @@ def test_wal_diff_end_to_end():
 
             mut_types = [m.mutation_type for m in mutations]
             assert MutationType.INSERT in mut_types
+        else:
+            assert False, "WAL file was not generated or too small during test setup."
 
     finally:
         if db_path.exists():

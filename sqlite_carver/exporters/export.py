@@ -171,6 +171,11 @@ def export_csv(records: List[CarvedRecord], output_path: str | Path) -> None:
     sorted_dynamic = sorted(dynamic_cols)
     header = all_col_names + sorted_dynamic
 
+    def sanitize_csv(val: Any) -> Any:
+        if isinstance(val, str) and val.startswith(("=", "+", "-", "@")):
+            return "'" + val
+        return val
+
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=header)
         writer.writeheader()
@@ -191,7 +196,10 @@ def export_csv(records: List[CarvedRecord], output_path: str | Path) -> None:
                     row[k] = json.dumps(v, ensure_ascii=False, default=json_safe_default)
                 else:
                     row[k] = v if v is not None else ""
-            writer.writerow(row)
+            
+            # Apply CSV injection sanitization
+            sanitized_row = {k: sanitize_csv(v) for k, v in row.items()}
+            writer.writerow(sanitized_row)
 
 
 def export_json(records: List[CarvedRecord | RowMutation], output_path: str | Path) -> None:

@@ -5,7 +5,7 @@
 [![Platform: Windows | Linux | macOS](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
 [![i18n: EN | FR](https://img.shields.io/badge/language-English%20%7C%20Fran%C3%A7ais-green.svg)]()
 
-**SQLite-Carver-Pro v1.9.0** is an offline digital forensics parser and analysis toolkit engineered to inspect B-Tree structures directly at the binary page level, carve deleted records from table and index pages (`0x0A`, `0x02`), resurrect deleted records via cross-index correlation (`resurrected_from_index`), handle R-Tree and FTS virtual tables natively, decode `WITHOUT ROWID` architectures, resurrect dropped tables (`DROP TABLE`) from Page 1 unallocated space, track intelligent record mutations and modifications (`--mutations-only`), decrypt SQLCipher (v3/v4 AES-256-CBC) and SQLite Encryption Extension (SEE AES-OFB) databases on-the-fly (`--key`), transparently decrypt WAL frame payloads, carve superseded WAL frames past checkpoints (WAL Slack Space), reconstruct multi-version page histories, detect anti-forensic `PRAGMA secure_delete` wiping, provide an interactive modern Dark-Mode Desktop GUI (`sqlite-carver gui`), inspect raw forensic byte payloads via interactive Hex/ASCII modals, render interactive database topology & Mermaid.js ER diagrams, hunt raw B-Tree pages from memory dumps/disk images with multi-core parallel processing (`carve-raw --workers`), analyze WAL shared memory (`.db-shm`), decode multi-format timestamps and GPS coordinates, audit physical page reserved areas (anti-forensics/steganography), guarantee cryptographic chain of custody, carve embedded file BLOBs, and decode nested binary structures (`bplist`, `protobuf`, `zlib`).
+**SQLite-Carver-Pro v1.9.1** is an offline digital forensics parser and analysis toolkit engineered to inspect B-Tree structures directly at the binary page level, carve deleted records from table and index pages (`0x0A`, `0x02`), resurrect deleted records via cross-index correlation (`resurrected_from_index`), handle R-Tree and FTS virtual tables natively, decode `WITHOUT ROWID` architectures, resurrect dropped tables (`DROP TABLE`) from Page 1 unallocated space, track intelligent record mutations and modifications (`--mutations-only`), decrypt SQLCipher (v3/v4 AES-256-CBC) and SQLite Encryption Extension (SEE AES-OFB) databases on-the-fly (`--key`), transparently decrypt WAL frame payloads, carve superseded WAL frames past checkpoints (WAL Slack Space), reconstruct multi-version page histories, detect anti-forensic `PRAGMA secure_delete` wiping, provide an interactive modern Dark-Mode Desktop GUI (`sqlite-carver gui`), inspect raw forensic byte payloads via interactive Hex/ASCII modals, render interactive database topology & Mermaid.js ER diagrams, hunt raw B-Tree pages from memory dumps/disk images with multi-core parallel processing (`carve-raw --workers`), analyze WAL shared memory (`.db-shm`), decode multi-format timestamps and GPS coordinates, audit physical page reserved areas (anti-forensics/steganography), guarantee cryptographic chain of custody, carve embedded file BLOBs, and decode nested binary structures (`bplist`, `protobuf`, `zlib`).
 
 ---
 
@@ -18,8 +18,8 @@
 
 ## 📑 Documentation & Reference Guides
 
-- 🇬🇧 **[Complete English Forensic Guide (PDF)](./SQLite_Carver_Pro_Forensic_Guide_v1.9.0_EN.pdf)** — Technical reference manual, mathematical score formulas, physical B-Tree internals, mutation diffing, and CLI guides.
-- 🇫🇷 **[Guide Forensique Intégral (PDF)](./Guide_Forensique_SQLite_Carver_Pro_v1.9.0_FR.pdf)** — Manuel de référence complet avec anatomie physique des B-Trees, rétro-ingénierie forensique du slack, analyse de mutations et barème de scoring.
+- 🇬🇧 **[Complete English Forensic Guide (PDF)](./SQLite_Carver_Pro_Forensic_Guide_v1.9.1_EN.pdf)** — Technical reference manual, mathematical score formulas, physical B-Tree internals, mutation diffing, and CLI guides.
+- 🇫🇷 **[Guide Forensique Intégral (PDF)](./Guide_Forensique_SQLite_Carver_Pro_v1.9.1_FR.pdf)** — Manuel de référence complet avec anatomie physique des B-Trees, rétro-ingénierie forensique du slack, analyse de mutations et barème de scoring.
 
 ---
 
@@ -178,7 +178,7 @@ sqlite-carver info evidence.db --lang fr
 **Terminal Output Preview:**
 ```
 ╔════════════════════════════════════════════════════════════════╗
-║             SQLite-Carver-Pro v1.9.0                           ║
+║             SQLite-Carver-Pro v1.9.1                           ║
 ║  Forensic Parser, Slack Carver, Freelist & WAL Diff Engine     ║
 ╚════════════════════════════════════════════════════════════════╝
 ╭─────────────────────── SQLite Database Header Analysis ────────────────────────╮

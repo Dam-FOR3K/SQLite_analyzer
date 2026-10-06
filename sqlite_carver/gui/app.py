@@ -664,7 +664,7 @@ class SQLiteCarverApp(ctk.CTk):
             enc_analysis = analyze_database_encryption(raw_bytes)
             if enc_analysis.is_encrypted:
                 if password:
-                    self.status_label.configure(text=f"Decrypting {enc_analysis.scheme} in-memory...")
+                    self.after(0, lambda scheme=enc_analysis.scheme: self.status_label.configure(text=f"Decrypting {scheme} in-memory..."))
                     raw_bytes, dec_meta = try_decrypt_database(raw_bytes, password)
                 else:
                     self.after(
@@ -721,11 +721,11 @@ class SQLiteCarverApp(ctk.CTk):
             elapsed = time.time() - start_time
 
             # Update UI on main thread
-            self.after(0, lambda: self._on_carving_complete(all_items, elapsed))
+            self.after(0, lambda items=all_items, e=elapsed: self._on_carving_complete(items, e))
 
         except Exception as e:
             err_msg = str(e)
-            self.after(0, lambda: self._on_carving_error(err_msg))
+            self.after(0, lambda msg=err_msg: self._on_carving_error(msg))
 
     def _on_carving_complete(self, all_items: List[Any], elapsed: float) -> None:
         self.is_carving = False

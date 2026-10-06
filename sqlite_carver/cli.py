@@ -575,7 +575,7 @@ def cmd_wal_diff(args: argparse.Namespace) -> None:
     multi_info = f", Multi-version Pages: {len(multi_pages)}" if multi_pages else ""
     console.print(f"[bold cyan]{t('wal_header_info', version=ver, size=psize, seq=seq, frames=len(engine.frames))}{slack_info}{multi_info}[/bold cyan]")
 
-    if getattr(args, "wal_slack", False) or getattr(args, "slack", False):
+    if getattr(args, "slack", False):
         slack_recs = engine.carve_wal_slack_records()
         console.print(f"[bold green]Carved {len(slack_recs)} record(s) from WAL Slack space (superseded frames)![/bold green]")
         if slack_recs:
@@ -997,6 +997,9 @@ Exemples d'utilisation concrets / Concrete usage examples:
     p_blob.set_defaults(func=cmd_decode_blob)
 
     if len(sys.argv) == 1:
+        if getattr(sys, 'frozen', False):
+            cmd_gui(argparse.Namespace(lang="en", db_path=None, key=None))
+            sys.exit(0)
         render_banner()
         parser.print_help()
         sys.exit(0)
