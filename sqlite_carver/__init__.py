@@ -7,7 +7,7 @@ carve, and analyze deleted records, freelists, unallocated spaces, and WAL
 transaction diffs from SQLite databases.
 """
 
-__version__ = "1.9.1"
+__version__ = "1.9.2"
 
 from sqlite_carver.core.carver import CarvedRecord, IndexSchema, SQLiteCarver, TableSchema
 from sqlite_carver.core.correlator import EntityCorrelator, FKLink, FKResolution
