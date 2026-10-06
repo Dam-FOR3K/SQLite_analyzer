@@ -103,7 +103,10 @@ def record_to_dict(rec: CarvedRecord) -> Dict[str, Any]:
         }
     if getattr(rec, "evidence_hash", None):
         res["_evidence_hash"] = rec.evidence_hash
-    res["raw_payload_hex"] = rec.raw_payload.hex() if getattr(rec, "raw_payload", None) else ""
+    raw_cell_bytes = getattr(rec, "raw_cell", None) or getattr(rec, "raw_payload", None)
+    res["raw_cell_hex"] = raw_cell_bytes.hex() if raw_cell_bytes else ""
+    res["raw_payload_hex"] = raw_cell_bytes.hex() if raw_cell_bytes else ""
+    res["raw_payload_only_hex"] = rec.raw_payload.hex() if getattr(rec, "raw_payload", None) else ""
     res["is_mutation"] = getattr(rec, "is_mutation", False)
     if getattr(rec, "mutation_diff", None):
         res["mutation_diff"] = serialize_value(rec.mutation_diff)
@@ -120,11 +123,13 @@ def mutation_to_dict(mut: RowMutation) -> Dict[str, Any]:
         }
         for d in mut.column_diffs
     ]
+    mut_bytes = getattr(mut, "raw_cell", None) or getattr(mut, "raw_payload", None)
     return {
         "is_mutation": True,
         "mutation_type": mut.mutation_type.value,
         "frame_index": mut.frame_index,
         "page_id": mut.page_id,
+        "offset_in_page": getattr(mut, "offset_in_page", 0),
         "table_name": mut.table_name,
         "rowid": mut.rowid,
         "is_commit": mut.is_commit,
@@ -135,6 +140,8 @@ def mutation_to_dict(mut: RowMutation) -> Dict[str, Any]:
         "old_values": [serialize_value(v) for v in mut.old_values] if mut.old_values else None,
         "new_values": [serialize_value(v) for v in mut.new_values] if mut.new_values else None,
         "details": mut.details,
+        "raw_cell_hex": mut_bytes.hex() if mut_bytes else "",
+        "raw_payload_hex": mut_bytes.hex() if mut_bytes else "",
     }
 
 

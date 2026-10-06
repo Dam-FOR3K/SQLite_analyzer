@@ -2007,20 +2007,26 @@ def generate_html_report(
             const hexContainer = document.getElementById('hexViewerContainer');
 
             const pageId = item.page_id !== undefined ? item.page_id : '-';
-            const offset = item.offset_in_page !== undefined ? '0x' + item.offset_in_page.toString(16) : '-';
+            const inPageOffset = (item.offset_in_page !== undefined && item.offset_in_page !== null) ? item.offset_in_page : 0;
+            const offset = '0x' + inPageOffset.toString(16).padStart(4, '0');
             const table = item.matched_table || item.table_name || 'Unknown';
             const rowid = item.rowid !== undefined && item.rowid !== null ? item.rowid : '-';
             const source = item.source || 'unknown';
-            const hexStr = item.raw_payload_hex || '';
+            const hexStr = item.raw_cell_hex || item.raw_payload_hex || '';
             const byteLen = Math.floor(hexStr.length / 2);
+
+            const pageSize = (typeof storageData !== 'undefined' && storageData && storageData.page_size) ? storageData.page_size : 4096;
+            const fileOffset = (item.page_id && item.page_id > 0) ? ((item.page_id - 1) * pageSize + inPageOffset) : null;
+            const fileOffStr = fileOffset !== null ? `0x${{fileOffset.toString(16).padStart(6, '0')}} (${{fileOffset.toLocaleString()}})` : '-';
 
             hexMeta.innerHTML = `
                 <div class="modal-meta-item"><span class="modal-meta-label">Page:</span> <span class="modal-meta-val">${{escapeHtml(pageId)}}</span></div>
-                <div class="modal-meta-item"><span class="modal-meta-label">Offset:</span> <span class="modal-meta-val">${{escapeHtml(offset)}}</span></div>
+                <div class="modal-meta-item"><span class="modal-meta-label">In-Page Offset:</span> <span class="modal-meta-val">${{escapeHtml(offset)}}</span></div>
+                <div class="modal-meta-item"><span class="modal-meta-label">File Offset:</span> <span class="modal-meta-val">${{escapeHtml(fileOffStr)}}</span></div>
                 <div class="modal-meta-item"><span class="modal-meta-label">Table:</span> <span class="modal-meta-val">${{escapeHtml(table)}}</span></div>
                 <div class="modal-meta-item"><span class="modal-meta-label">RowID:</span> <span class="modal-meta-val">${{escapeHtml(rowid)}}</span></div>
                 <div class="modal-meta-item"><span class="modal-meta-label">Source:</span> <span class="modal-meta-val">${{escapeHtml(source)}}</span></div>
-                <div class="modal-meta-item"><span class="modal-meta-label">Size:</span> <span class="modal-meta-val">${{byteLen.toLocaleString()}} bytes</span></div>
+                <div class="modal-meta-item"><span class="modal-meta-label">Size:</span> <span class="modal-meta-val">${{byteLen.toLocaleString()}} bytes (Integral Raw Cell)</span></div>
             `;
 
             let rows = '';
@@ -2029,7 +2035,7 @@ def generate_html_report(
             }} else {{
                 for (let pos = 0; pos < byteLen; pos += 16) {{
                     const chunkHex = hexStr.substring(pos * 2, Math.min(hexStr.length, (pos + 16) * 2));
-                    const offsetStr = pos.toString(16).padStart(8, '0');
+                    const offsetStr = (inPageOffset + pos).toString(16).padStart(8, '0');
                     
                     let byteTokens = [];
                     let asciiStr = '';
@@ -2046,7 +2052,7 @@ def generate_html_report(
                     const hexFormatted = byteTokens.slice(0, 8).join(' ') + '  ' + byteTokens.slice(8).join(' ');
                     rows += `
                         <div class="hex-row">
-                            <span class="hex-offset">${{offsetStr}}</span>
+                            <span class="hex-offset">${{escapeHtml(offsetStr)}}</span>
                             <span class="hex-bytes">${{escapeHtml(hexFormatted)}}</span>
                             <span class="hex-ascii">${{escapeHtml(asciiStr)}}</span>
                         </div>

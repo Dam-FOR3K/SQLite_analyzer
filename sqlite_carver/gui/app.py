@@ -58,7 +58,7 @@ class HexInspectorModal(ctk.CTkToplevel):
         self.grab_set()
 
         self.record = record
-        self.raw_bytes = bytes(getattr(record, "raw_payload", b"") or b"")
+        self.raw_bytes = bytes(getattr(record, "raw_cell", None) or getattr(record, "raw_payload", b"") or b"")
         self.configure(fg_color="#0f172a")
 
         # Header Frame
@@ -75,18 +75,28 @@ class HexInspectorModal(ctk.CTkToplevel):
 
         # Meta bar
         page_id = getattr(record, "page_id", "-")
-        offset = f"0x{getattr(record, 'offset_in_page', 0):04x}"
+        off_in_page = getattr(record, "offset_in_page", 0) or 0
+        offset = f"0x{off_in_page:04x}"
         tbl = getattr(record, "matched_table", None) or getattr(record, "table_name", "Unknown")
         rowid = getattr(record, "rowid", "-")
         source = getattr(record, "source", "unknown")
         size_bytes = len(self.raw_bytes)
 
+        # Calculate absolute file offset if page_id is valid
+        carver_parser = getattr(getattr(parent, "carver", None), "parser", None)
+        psize = getattr(carver_parser, "page_size", 4096) if carver_parser else 4096
+        if isinstance(page_id, int) and page_id >= 1:
+            abs_off = (page_id - 1) * psize + off_in_page
+            file_off_str = f"  |  File Offset: 0x{abs_off:06x} ({abs_off:,})"
+        else:
+            file_off_str = ""
+
         meta_frame = ctk.CTkFrame(self, fg_color="#0b1120", corner_radius=6)
         meta_frame.pack(fill="x", padx=16, pady=4)
 
         meta_text = (
-            f"Page: {page_id}  |  Offset: {offset}  |  Table: {tbl}  |  "
-            f"RowID: {rowid}  |  Source: {source}  |  Size: {size_bytes:,} bytes"
+            f"Page: {page_id}  |  In-Page Offset: {offset}{file_off_str}  |  "
+            f"Table: {tbl}  |  RowID: {rowid}  |  Size: {size_bytes:,} bytes (Integral Raw Cell)"
         )
         ctk.CTkLabel(
             meta_frame,
@@ -168,10 +178,11 @@ class HexInspectorModal(ctk.CTkToplevel):
         lines = []
         data = self.raw_bytes
         length = len(data)
+        base_offset = getattr(self.record, "offset_in_page", 0) or 0
 
         for i in range(0, length, 16):
             chunk = data[i : i + 16]
-            offset_str = f"{i:08x}"
+            offset_str = f"{(base_offset + i):08x}"
             hex_tokens = [f"{b:02x}" for b in chunk]
             if len(hex_tokens) < 16:
                 hex_tokens.extend(["  "] * (16 - len(hex_tokens)))

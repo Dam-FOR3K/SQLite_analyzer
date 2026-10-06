@@ -46,6 +46,9 @@ class RowMutation:
     diff_state: str = "diff_from_db"  # 'wal_only', 'diff_from_db', 'same_as_db', 'wal_only_table'
     journal_source: str = "wal"  # 'wal' or 'rollback_journal'
     details: str = ""
+    offset_in_page: int = 0
+    raw_payload: Optional[bytes] = None
+    raw_cell: Optional[bytes] = None
 
 
 @dataclass
@@ -474,6 +477,9 @@ class WalDiffEngine:
                             is_wal_only_table=is_wal_only,
                             diff_state=d_state,
                             details=f"Inserted into {prefix}{rec.matched_table or 'Unknown Table'}",
+                            offset_in_page=getattr(rec, "offset_in_page", 0),
+                            raw_payload=getattr(rec, "raw_payload", None),
+                            raw_cell=getattr(rec, "raw_cell", None),
                         )
                     )
                     row_state[key] = rec
@@ -506,6 +512,9 @@ class WalDiffEngine:
                                 column_diffs=diffs,
                                 is_commit=frame.is_commit,
                                 details=f"Updated in {rec.matched_table or 'Unknown Table'}",
+                                offset_in_page=getattr(rec, "offset_in_page", 0),
+                                raw_payload=getattr(rec, "raw_payload", None),
+                                raw_cell=getattr(rec, "raw_cell", None),
                             )
                         )
                         row_state[key] = rec

@@ -318,6 +318,7 @@ class CarvedRecord:
     evidence_hash: str = ""
     is_mutation: bool = False
     mutation_diff: Dict[str, Any] = field(default_factory=dict)
+    raw_cell: Optional[bytes] = None
 
 
 def decode_truncated_record(
@@ -716,6 +717,7 @@ class SQLiteCarver:
                                                         column_types=rec.column_types,
                                                         serial_types=rec.serial_types,
                                                         raw_payload=rec.raw_payload,
+                                                        raw_cell=bytes(data[idx : idx + advance_len]),
                                                         is_partial=rec.is_partial,
                                                         details=detail_msg,
                                                     )
@@ -755,6 +757,7 @@ class SQLiteCarver:
                                 column_types=rec_res.column_types,
                                 serial_types=rec_res.serial_types,
                                 raw_payload=rec_res.raw_payload,
+                                raw_cell=bytes(data[idx : idx + rec_res.header_size + expected_body_len]),
                                 is_partial=rec_res.is_partial,
                                 details=detail_msg,
                             )
@@ -773,6 +776,8 @@ class SQLiteCarver:
                     detail_msg = f"Incomplete record carved from {source}"
                     if not tbl:
                         detail_msg += " (unmapped schema)"
+                    adv_step = len(trunc_res.raw_payload) if trunc_res.raw_payload else trunc_res.header_size
+                    adv_step = min(adv_step, data_len - idx)
                     results.append(
                         CarvedRecord(
                             page_id=page_id,
@@ -786,6 +791,7 @@ class SQLiteCarver:
                             column_types=trunc_res.column_types,
                             serial_types=trunc_res.serial_types,
                             raw_payload=trunc_res.raw_payload,
+                            raw_cell=bytes(data[idx : idx + adv_step]),
                             is_partial=True,
                             details=detail_msg,
                         )
@@ -849,6 +855,7 @@ class SQLiteCarver:
                                 column_types=c.record.column_types,
                                 serial_types=c.record.serial_types,
                                 raw_payload=c.raw_payload,
+                                raw_cell=c.raw_cell,
                                 is_partial=c.record.is_partial,
                                 details=f"Active cell from WITHOUT ROWID table '{tbl}'",
                             )
@@ -881,6 +888,7 @@ class SQLiteCarver:
                                 column_types=c.record.column_types,
                                 serial_types=c.record.serial_types,
                                 raw_payload=c.raw_payload,
+                                raw_cell=c.raw_cell,
                                 is_partial=c.record.is_partial,
                                 details=detail,
                             )
@@ -914,6 +922,7 @@ class SQLiteCarver:
                             column_types=c.record.column_types,
                             serial_types=c.record.serial_types,
                             raw_payload=c.raw_payload,
+                            raw_cell=c.raw_cell,
                             is_partial=c.record.is_partial,
                             details="Active B-tree cell",
                         )
@@ -1010,6 +1019,7 @@ class SQLiteCarver:
                                                 column_types=["TEXT", "INTEGER"],
                                                 serial_types=[(len(payload_bytes) * 2) + 13, 1],
                                                 raw_payload=bytes(fb.raw_bytes[4:]),
+                                                raw_cell=bytes(fb.raw_bytes),
                                                 is_partial=False,
                                                 details=f"Carved from index '{idx_schema.name}' freeblock with overwritten header ({idx_schema.table_name})",
                                             )
@@ -1058,6 +1068,7 @@ class SQLiteCarver:
                         column_types=["BLOB"],
                         serial_types=[len(unalloc_bytes) * 2 + 12],
                         raw_payload=unalloc_bytes,
+                        raw_cell=unalloc_bytes,
                         is_partial=True,
                         details="Unstructured data (non-zero bytes) found in unallocated space gap.",
                     )
@@ -1111,6 +1122,7 @@ class SQLiteCarver:
                                 column_types=["BLOB"],
                                 serial_types=[len(gap_data) * 2 + 12],
                                 raw_payload=gap_data,
+                                raw_cell=gap_data,
                                 is_partial=True,
                                 details="Unstructured data (non-zero bytes) found in cell slack gap.",
                             )
@@ -1155,6 +1167,7 @@ class SQLiteCarver:
                             column_types=["BLOB"],
                             serial_types=[len(gap_data) * 2 + 12],
                             raw_payload=gap_data,
+                            raw_cell=gap_data,
                             is_partial=True,
                             details="Unstructured data (non-zero bytes) found in trailing cell slack gap.",
                         )
@@ -1206,6 +1219,7 @@ class SQLiteCarver:
                             column_types=col_types,
                             serial_types=[serial_type],
                             raw_payload=res_bytes,
+                            raw_cell=res_bytes,
                             is_partial=False,
                             details=f"Extracted {res_sz} bytes from page {page_id} reserved space (steganography / anti-forensics)",
                         )
